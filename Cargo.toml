@@ -1,0 +1,30 @@
+[package]
+name = "gapfil"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Conservative parallel long-read scaffold gap filling"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+helicase = { version = "=0.2.0", features = ["xz", "bz2"] }
+poasta = { path = "vendor/poasta" }
+rayon = "1.11"
+rustc-hash = "2.1"
+simd-minimizers = "=2.3.1"
+tempfile = "3.23"
+
+[dev-dependencies]
+deko = { version = "=0.6.0", features = ["flate2", "zstd", "bzip2", "xz"], default-features = false }
+
+[features]
+no-pdep = ["helicase/no-pdep"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
