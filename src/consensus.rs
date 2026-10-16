@@ -1,11 +1,28 @@
-use crate::{input, is_base};
+use crate::is_base;
 use anyhow::{Result, ensure};
 use clap::ValueEnum;
 use poasta::aligner::PoastaAligner;
 use poasta::aligner::config::AffineMinGapCost;
 use poasta::aligner::scoring::{AlignmentType, GapAffine};
 use poasta::graphs::poa::POAGraph;
-use poasta::io::fasta::poa_graph_to_fasta;
+use poasta::io::fasta::poa_graph_to_msa;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MsaBackend {
+    Poasta,
+    Spoars,
+    SpoarsScalar,
+}
+
+impl MsaBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Poasta => "poasta",
+            Self::Spoars => "spoars",
+            Self::SpoarsScalar => "spoars-scalar",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Preset {
@@ -92,6 +109,14 @@ pub fn from_rows(rows: &[Vec<u8>]) -> Result<Consensus> {
 }
 
 pub fn build(sequences: &mut [Vec<u8>], preset: Preset) -> Result<Consensus> {
+    build_with_backend(sequences, preset, MsaBackend::Poasta)
+}
+
+pub fn build_with_backend(
+    sequences: &mut [Vec<u8>],
+    preset: Preset,
+    backend: MsaBackend,
+) -> Result<Consensus> {
     ensure!(!sequences.is_empty(), "No consensus evidence");
     ensure!(
         sequences
@@ -99,8 +124,6 @@ pub fn build(sequences: &mut [Vec<u8>], preset: Preset) -> Result<Consensus> {
             .all(|s| !s.is_empty() && s.iter().all(|&b| is_base(b))),
         "Invalid consensus evidence"
     );
-    // Stable lexical order makes progressive POA independent of worker scheduling.
-    sequences.sort_unstable();
     if sequences.iter().all(|s| s == &sequences[0]) {
         let len = sequences[0].len();
         return Ok(Consensus {
@@ -111,6 +134,18 @@ pub fn build(sequences: &mut [Vec<u8>], preset: Preset) -> Result<Consensus> {
             rejection: None,
         });
     }
+    // Stable lexical order makes progressive POA independent of worker scheduling.
+    sequences.sort_unstable();
+    let rows = match backend {
+        MsaBackend::Poasta => poasta_rows(sequences, preset)?,
+        MsaBackend::Spoars => spoars_rows(sequences, preset, true)?,
+        MsaBackend::SpoarsScalar => spoars_rows(sequences, preset, false)?,
+    };
+    validate_rows(&rows, sequences)?;
+    from_rows(&rows)
+}
+
+fn poasta_rows(sequences: &[Vec<u8>], preset: Preset) -> Result<Vec<Vec<u8>>> {
     let aligner = PoastaAligner::new(AffineMinGapCost(preset.costs()), AlignmentType::Global);
     let mut graph = POAGraph::<u32>::new();
     for (id, sequence) in sequences.iter().enumerate() {
@@ -127,30 +162,82 @@ pub fn build(sequences: &mut [Vec<u8>], preset: Preset) -> Result<Consensus> {
             )?;
         }
     }
-    let mut fasta = Vec::new();
-    poa_graph_to_fasta(&graph, &mut fasta)?;
-    let rows = input::fasta_bytes(&fasta)?;
-    ensure!(
-        rows.len() == sequences.len(),
-        "POASTA MSA is missing sequences"
-    );
-    // Check that serialization/parsing retained every base and MSA gap.
+    Ok(poa_graph_to_msa(&graph)?)
+}
+
+fn spoars_rows(sequences: &[Vec<u8>], preset: Preset, simd: bool) -> Result<Vec<Vec<u8>>> {
+    use poasta::aligner::scoring::AlignmentCosts;
+    use spoars::align::{AlignmentEngine, AlignmentType as Mode, Scoring, SimdEngine, SisdEngine};
+    let costs = preset.costs();
+    let extend = costs.gap_extend() as i8;
+    // POASTA charges open + length*extend; SPOA charges g + (length-1)*e.
+    let open = costs.gap_open() as i8 + extend;
+    let scoring = Scoring::new(0, -(costs.mismatch() as i8), -open, -extend, -open, -extend)?;
+    let mut graph = spoars::graph::Graph::new();
+    let mut add = |engine: &mut dyn AlignmentEngine| -> Result<()> {
+        for sequence in sequences {
+            let (alignment, _) = engine.align(sequence, &graph);
+            graph.add_alignment_weight(&alignment, sequence, 1)?;
+        }
+        Ok(())
+    };
+    if simd {
+        add(&mut SimdEngine::new(Mode::Global, scoring))?;
+    } else {
+        add(&mut SisdEngine::new(Mode::Global, scoring))?;
+    }
+    Ok(graph
+        .generate_msa(false)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect())
+}
+
+fn validate_rows(rows: &[Vec<u8>], sequences: &[Vec<u8>]) -> Result<()> {
+    ensure!(rows.len() == sequences.len(), "MSA is missing sequences");
+    // Each backend must preserve every contributing sequence and its gaps.
     for (row, original) in rows.iter().zip(sequences.iter()) {
         ensure!(
-            row.sequence
-                .iter()
+            row.iter()
                 .filter(|&&b| b != b'-')
                 .copied()
                 .eq(original.iter().copied()),
             "MSA did not preserve input sequence"
         );
     }
-    from_rows(&rows.into_iter().map(|r| r.sequence).collect::<Vec<_>>())
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternate_backends_preserve_spans_and_the_quality_definition() {
+        for backend in [
+            MsaBackend::Poasta,
+            MsaBackend::Spoars,
+            MsaBackend::SpoarsScalar,
+        ] {
+            for preset in [Preset::Hifi, Preset::Ont] {
+                let mut reads = vec![b"ACGTAC".to_vec(), b"ACTGTAC".to_vec(), b"ACTGTAC".to_vec()];
+                let c = build_with_backend(&mut reads, preset, backend).unwrap();
+                assert_eq!(c.sequence, b"ACTGTAC");
+                assert_eq!((c.unanimous, c.columns), (6, 7));
+                let mut reads = vec![b"A".to_vec(), b"C".to_vec()];
+                assert_eq!(
+                    build_with_backend(&mut reads, preset, backend)
+                        .unwrap()
+                        .rejection,
+                    Some("consensus_tie")
+                );
+                let mut reads = vec![b"A".to_vec(), b"CA".to_vec(), b"CA".to_vec()];
+                let c = build_with_backend(&mut reads, preset, backend).unwrap();
+                assert_eq!(c.sequence, b"CA");
+                assert_eq!((c.unanimous, c.columns), (1, 2));
+            }
+        }
+    }
     #[test]
     fn unanimity_includes_indels_and_ambiguity() {
         let c = from_rows(&[b"AC-G-N".to_vec(), b"ACTG-A".to_vec(), b"ACTG-A".to_vec()]).unwrap();

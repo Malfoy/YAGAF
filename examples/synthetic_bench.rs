@@ -1,7 +1,6 @@
 //! Deterministic synthetic data only. Uses helicase for every FASTA read.
 use anyhow::{Result, ensure};
 use clap::Parser;
-use gapfil::{input, revcomp};
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
@@ -9,6 +8,7 @@ use std::{
     process::Command,
     time::Instant,
 };
+use yagaf::{input, revcomp};
 
 #[derive(Parser)]
 struct Options {
@@ -93,10 +93,10 @@ fn main() -> Result<()> {
         .unwrap()
         .parent()
         .unwrap()
-        .join("gapfil");
+        .join("yagaf");
     ensure!(
         executable.exists(),
-        "Build gapfil with cargo build --release first"
+        "Build yagaf with cargo build --release first"
     );
     let mut summary = File::create(options.directory.join("summary.tsv"))?;
     writeln!(
@@ -133,7 +133,7 @@ fn main() -> Result<()> {
             ])
             .status()?;
         let seconds = start.elapsed().as_secs_f64();
-        ensure!(status.success(), "Gapfil benchmark process failed");
+        ensure!(status.success(), "YAGAF benchmark process failed");
         let actual = input::scaffolds(&out)?;
         ensure!(
             actual.len() == expected.len()

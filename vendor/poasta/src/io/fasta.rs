@@ -1,9 +1,9 @@
 use petgraph::graph::IndexType;
 use petgraph::visit::EdgeRef;
+use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet;
 use serde::de::DeserializeOwned;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::Write;
 use std::iter;
 
@@ -16,11 +16,12 @@ fn fasta_aln_for_seq<Ix>(
     node_to_column: &HashMap<POANodeIndex<Ix>, usize>,
     seq_id: usize,
     start_node: POANodeIndex<Ix>,
+    width: usize,
 ) -> Vec<u8>
 where
     Ix: IndexType + DeserializeOwned,
 {
-    let mut seq = Vec::new();
+    let mut seq = Vec::with_capacity(width);
     let mut curr = Some(start_node);
     // Columns are zero-based. Track the next output column, rather than using
     // zero as both a sentinel and the first aligned column (upstream bug).
@@ -47,22 +48,21 @@ where
         next_col = node_col + 1;
     }
 
-    if let Some(max_col) = node_to_column.values().max() {
-        let gap_length = *max_col + 1 - next_col;
+    if next_col < width {
+        let gap_length = width - next_col;
         seq.extend(iter::repeat(b'-').take(gap_length));
     }
 
     seq
 }
 
-pub fn poa_graph_to_fasta<Ix, W>(graph: &POAGraph<Ix>, output: W) -> Result<(), PoastaError>
+pub fn poa_graph_to_msa<Ix>(graph: &POAGraph<Ix>) -> Result<Vec<Vec<u8>>, PoastaError>
 where
     Ix: IndexType + DeserializeOwned,
-    W: Write,
 {
     // First assign a column in the final MSA output for every node in the graph,
     // by visiting nodes in topological order, taking into account 'aligned_nodes'
-    let mut node_to_column = HashMap::new();
+    let mut node_to_column = HashMap::default();
     let mut stack = vec![(
         graph.start_node(),
         RefCell::new(Vec::from_iter(graph.successors(graph.start_node()))),
@@ -125,15 +125,25 @@ where
         }
     }
 
-    let mut writer = output;
+    Ok(graph
+        .sequences
+        .iter()
+        .enumerate()
+        .map(|(seq_id, seq)| {
+            fasta_aln_for_seq(graph, &node_to_column, seq_id, seq.start_node(), curr_col)
+        })
+        .collect())
+}
 
-    for (seq_id, seq) in graph.sequences.iter().enumerate() {
-        writeln!(writer, ">{}", seq.name())?;
-
-        let seq = fasta_aln_for_seq(graph, &node_to_column, seq_id, seq.start_node());
-        writer.write_all(&seq)?;
-        writer.write_all(b"\n")?;
+pub fn poa_graph_to_fasta<Ix, W>(graph: &POAGraph<Ix>, mut output: W) -> Result<(), PoastaError>
+where
+    Ix: IndexType + DeserializeOwned,
+    W: Write,
+{
+    for (sequence, row) in graph.sequences.iter().zip(poa_graph_to_msa(graph)?) {
+        writeln!(output, ">{}", sequence.name())?;
+        output.write_all(&row)?;
+        output.write_all(b"\n")?;
     }
-
     Ok(())
 }

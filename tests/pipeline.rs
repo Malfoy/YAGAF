@@ -1,13 +1,13 @@
 use clap::Parser;
-use gapfil::{
+use std::{fs, io::Write};
+use tempfile::TempDir;
+use yagaf::{
     Scaffold, discover,
     index::{Index, Scanner, Span},
     input,
     pipeline::{Args, run},
     revcomp,
 };
-use std::{fs, io::Write};
-use tempfile::TempDir;
 
 fn dna(seed: &mut u64, len: usize) -> Vec<u8> {
     (0..len)
@@ -71,7 +71,7 @@ impl Fixture {
     }
     fn args(&self, name: &str, extra: &[&str]) -> Args {
         let mut values: Vec<String> = vec![
-            "gapfil".into(),
+            "yagaf".into(),
             "--scaffolds".into(),
             self.dir.path().join("scaffolds.fa").display().to_string(),
             "--reads".into(),
@@ -280,6 +280,44 @@ fn forty_gaps_and_length_changing_replacements_are_deterministic() {
     assert_eq!(f.output("four")[0].sequence, expected);
     assert_eq!(f.report("one"), f.report("four"));
     assert_eq!(f.report("one").matches("\tfilled\taccepted").count(), 40);
+}
+
+#[test]
+fn parallel_merge_preserves_capacity_decisions_and_read_order() {
+    let f = Fixture::new();
+    let mut seed = 21934572581;
+    let mut masked = Vec::new();
+    let mut truth = Vec::new();
+    for _ in 0..40 {
+        let left = dna(&mut seed, 23);
+        let right = dna(&mut seed, 23);
+        masked.extend(joined(&[&left, b"NNN", &right]));
+        truth.extend(joined(&[&left, b"ACTG", &right]));
+    }
+    f.write_scaffolds(&[masked]);
+    f.write_reads(
+        &(0..128)
+            .map(|i| (format!("r{i}"), truth.clone()))
+            .collect::<Vec<_>>(),
+    );
+    for (label, limits) in [
+        ("room", vec![]),
+        ("tight", vec!["--max-evidence-bytes", "1000"]),
+    ] {
+        let one = format!("one-{label}");
+        let many = format!("many-{label}");
+        let mut a = vec!["--threads", "1"];
+        a.extend(&limits);
+        let mut b = vec!["--threads", "32"];
+        b.extend(&limits);
+        run(&f.args(&one, &a)).unwrap();
+        run(&f.args(&many, &b)).unwrap();
+        assert_eq!(f.output(&one)[0].sequence, f.output(&many)[0].sequence);
+        assert_eq!(f.report(&one), f.report(&many));
+        if label == "room" {
+            assert_eq!(f.output(&many)[0].sequence, truth);
+        }
+    }
 }
 
 #[test]

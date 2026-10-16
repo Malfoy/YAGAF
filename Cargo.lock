@@ -296,22 +296,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "gapfil"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "deko",
- "helicase",
- "poasta",
- "rayon",
- "rustc-hash",
- "simd-minimizers",
- "tempfile",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -827,6 +811,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "spoars"
+version = "0.1.4"
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -924,6 +912,23 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "yagaf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "deko",
+ "helicase",
+ "poasta",
+ "rayon",
+ "rustc-hash",
+ "simd-minimizers",
+ "spoars",
+ "tempfile",
+]
 
 [[package]]
 name = "zerocopy"

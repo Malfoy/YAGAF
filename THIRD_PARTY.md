@@ -1,6 +1,6 @@
 # Third-party sources
 
-Gapfil is GPL-3.0-only; the full license is in `LICENSE`.
+YAGAF is GPL-3.0-only; the full license is in `LICENSE`.
 
 ## K2Rmini
 
@@ -8,12 +8,14 @@ Gapfil is GPL-3.0-only; the full license is in `LICENSE`.
 - Revision: `29d39e9a4c81d099bb89c4f39e705322affad508`
 - License: GPL-3.0, retained at `vendor/K2Rmini/LICENSE`.
 - A clone is retained under `vendor/K2Rmini` as the upstream reference. It is not
-  built or invoked by Gapfil.
+  built or invoked by YAGAF.
 - `src/index.rs` adapts `src/bin/k2rminimulti.rs`: shared minimizer/k-mer indexes,
-  SIMD minimizer prefilter, NtHash SIMD k-mer hashing, and read batching. Gapfil
+  SIMD minimizer selection, NtHash SIMD k-mer hashing, and read batching. YAGAF
   replaces fixed query masks with postings of gap/side/strand identifiers, verifies
   actual bases and positions, and extracts one interval per uniquely paired gap.
-  Each ACTG run is processed independently; ambiguous bases are never removed to
+  Minimizer-offset postings locate candidate starts directly, with full k-mer
+  hashing retained for short minimizers or large posting lists. Index construction
+  and assembly uniqueness checks run in parallel. Each ACTG run is processed independently; ambiguous bases are never removed to
   concatenate unrelated sequence runs. Reverse complements are indexed explicitly.
 
 ## POASTA
@@ -25,8 +27,9 @@ Gapfil is GPL-3.0-only; the full license is in `LICENSE`.
   algorithm is retained. CLI binaries and graph import/export functions unrelated
   to alignment were excluded from the compiled library. `Cargo.toml.upstream` and
   `README.upstream.md` retain upstream package information.
-- The FASTA MSA exporter writes bytes directly instead of using noodles. Its output
-  is parsed exclusively by helicase in Gapfil. No upstream FASTA reader is compiled.
+- Alignment rows pass directly from POASTA to YAGAF in memory, avoiding FASTA
+  serialization and reparsing. The retained FASTA exporter wraps the same row
+  construction. No upstream FASTA reader is compiled.
 - Fixed an upstream zero-based column padding bug: leading insertions/deletions
   could produce unequal MSA row lengths. Export now tracks the next output column
   explicitly and pads all rows through the last column.
@@ -36,12 +39,25 @@ Gapfil is GPL-3.0-only; the full license is in `LICENSE`.
   while keeping this snapshot buildable in the restricted environment. Its bounds,
   ordering, conversions, and representation are covered by the vendored unit test.
 - Rust formatting was applied to the snapshot. Uncompiled upstream helper modules
-  are retained for reference; Gapfil does not expose their original file readers.
+  are retained for reference; YAGAF does not expose their original file readers.
+
+## SPOARS
+
+- Source: <https://github.com/fg-labs/spoars>
+- Published crate: `spoars` 0.1.4, downloaded from crates.io.
+- Archive SHA-256: `501e9faa2a392e46084161ff4ec615ea13bdf20cef884891aa353d451dd7a80e`.
+- License: MIT, retained at `vendor/spoars/LICENSE`; upstream provenance is in
+  `vendor/spoars/THIRD-PARTY.md`.
+- `vendor/spoars` contains its native Rust library, including SIMD and scalar POA
+  engines. CLI, tests, oracle, and file parser dependencies are excluded. The
+  library aligns extracted spans in memory; it does not read sequence files.
+- Global affine scoring accounts for the different first-gap penalty convention.
+  MSA rows use the same unanimity and consensus checks as POASTA.
 
 ## Helicase and SIMD crates
 
-Every FASTA/FASTQ input, including in-memory MSA FASTA, is parsed by helicase 0.2.0:
-<https://github.com/imartayan/helicase>. Gapfil retains Ns, case, headers, and sequence
+Every FASTA/FASTQ input is parsed by helicase 0.2.0:
+<https://github.com/imartayan/helicase>. YAGAF retains Ns, case, headers, and sequence
 coordinates. SIMD indexing uses simd-minimizers 2.3.1 and its matching packed-seq and
 seq-hash versions. `Cargo.lock` pins the complete dependency graph; the vendored
 POASTA snapshot does not require a network Git checkout during a build.

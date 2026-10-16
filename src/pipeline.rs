@@ -1,6 +1,6 @@
 use crate::{
     Gap, Scaffold,
-    consensus::{self, Consensus, Preset},
+    consensus::{self, Consensus, MsaBackend, Preset},
     discover,
     index::{Index, Scanner, Span},
     input,
@@ -11,13 +11,18 @@ use crossbeam_channel::bounded;
 use helicase::HelicaseParser;
 use helicase::parser::Format;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::cell::RefCell;
+use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "yagaf",
     version,
     about = "Conservative parallel scaffold gap filling using exact flank anchors and POASTA"
 )]
@@ -40,6 +45,9 @@ pub struct Args {
     /// Read technology; selects initial MSA scoring, not acceptance thresholds
     #[arg(long, value_enum)]
     pub preset: Preset,
+    /// MSA implementation; alternative engines are available for comparison
+    #[arg(long, value_enum, default_value = "poasta")]
+    pub msa_backend: MsaBackend,
     /// One adjacent anchor of this length on each side (3..=63)
     #[arg(short = 'k', long)]
     pub k: usize,
@@ -55,7 +63,7 @@ pub struct Args {
     /// Parallel read workers (default: available CPUs)
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
-    /// Concurrent gap MSAs (default: min(threads,2))
+    /// Concurrent gap MSAs (default: threads)
     #[arg(long)]
     pub msa_threads: Option<usize>,
     /// Reject a gap if any unambiguous spanning interval exceeds this many bases
@@ -74,7 +82,7 @@ pub struct Args {
     #[arg(long, default_value_t = 20_000_000)]
     pub max_msa_cells: usize,
     /// Target bases per input batch; two batches may be queued
-    #[arg(long, default_value_t = 4_194_304)]
+    #[arg(long, default_value_t = 16_777_216)]
     pub batch_bases: usize,
     /// Fail on longer input reads (checked after helicase parses the record)
     #[arg(long, default_value_t = 10_000_000)]
@@ -161,8 +169,13 @@ fn normalized_destination(path: &Path) -> Result<PathBuf> {
 }
 
 struct Read {
-    id: Vec<u8>,
+    id: Arc<[u8]>,
+    id_hash: u64,
     sequence: Vec<u8>,
+}
+
+thread_local! {
+    static READ_SCANNER: RefCell<Scanner> = RefCell::new(Scanner::default());
 }
 
 #[derive(Default)]
@@ -181,7 +194,8 @@ struct Evidence {
     spanning_records: usize,
     ambiguous_pairs: usize,
     duplicate_ids: usize,
-    ids: Vec<Vec<u8>>,
+    ids: Vec<Arc<[u8]>>,
+    id_index: FxHashMap<u64, usize>,
     sequences: Vec<Vec<u8>>,
     bytes: usize,
     rejection: Option<&'static str>,
@@ -193,10 +207,11 @@ impl Evidence {
         *total -= self.bytes;
         self.bytes = 0;
         self.ids.clear();
+        self.id_index.clear();
         self.sequences.clear();
     }
 
-    fn add(&mut self, span: Span, id: &[u8], args: &Args, total: &mut usize) {
+    fn add(&mut self, span: Span, read: &Read, args: &Args, total: &mut usize) {
         self.candidates += 1;
         if matches!(span, Span::AmbiguousPair) {
             self.ambiguous_pairs += 1;
@@ -214,7 +229,15 @@ impl Evidence {
             }
             Span::AmbiguousPair => unreachable!(),
         };
-        if let Some(previous) = self.ids.iter().position(|old| old == id) {
+        let id = &read.id;
+        let previous = self.id_index.get(&read.id_hash).and_then(|&first| {
+            if self.ids[first].as_ref() == id.as_ref() {
+                Some(first)
+            } else {
+                self.ids.iter().position(|old| old.as_ref() == id.as_ref())
+            }
+        });
+        if let Some(previous) = previous {
             self.duplicate_ids += 1;
             if self.sequences[previous] != sequence {
                 self.reject("conflicting_duplicate_read_id", total);
@@ -237,7 +260,8 @@ impl Evidence {
         }
         self.bytes += bytes;
         *total += bytes;
-        self.ids.push(id.to_vec());
+        self.id_index.entry(read.id_hash).or_insert(self.ids.len());
+        self.ids.push(Arc::clone(id));
         self.sequences.push(sequence);
     }
 }
@@ -273,9 +297,12 @@ fn produce_reads(
             );
         }
         bases += sequence.len() + id.len();
+        let mut id_hasher = FxHasher::default();
+        id_hasher.write(id);
         batch.push(Read {
-            id: id.to_vec(),
-            sequence: sequence.to_vec(),
+            id: Arc::from(id),
+            id_hash: id_hasher.finish(),
+            sequence: parser.get_dna_string_owned(),
         });
         count += 1;
         if bases >= args.batch_bases {
@@ -315,6 +342,7 @@ fn collect(
         })
         .collect();
     let mut total = 0;
+    let mut buckets: Vec<Vec<(usize, Span)>> = (0..gaps.len()).map(|_| Vec::new()).collect();
     let timings = std::thread::scope(|scope| -> Result<ReadTimings> {
         let (tx, rx) = bounded(2);
         let producer = scope.spawn(move || {
@@ -342,18 +370,56 @@ fn collect(
                 let spans: Vec<_> = pool.install(|| {
                     batch
                         .par_iter()
-                        .map_init(Scanner::default, |scanner, read| {
-                            index.extract(&read.sequence, scanner, args.max_span)
+                        .map(|read| {
+                            READ_SCANNER.with_borrow_mut(|scanner| {
+                                index.extract(&read.sequence, scanner, args.max_span)
+                            })
                         })
                         .collect()
                 });
                 main_timings.extraction += clock.elapsed().as_secs_f64();
                 let clock = Instant::now();
-                // Indexed parallel collect and ordered merge ensure that capacity
-                // decisions and read support do not depend on scheduling.
-                for (read, found) in batch.into_iter().zip(spans) {
-                    for (gap, span) in found {
-                        evidence[gap].add(span, &read.id, args, &mut total);
+                let mut potential_bytes = 0usize;
+                let mut hits = 0;
+                for (read, found) in batch.iter().zip(&spans) {
+                    hits += found.len();
+                    for (_, span) in found {
+                        if let Span::Sequence(sequence) = span {
+                            potential_bytes = potential_bytes
+                                .saturating_add(sequence.len())
+                                .saturating_add(read.id.len());
+                        }
+                    }
+                }
+                // If even the upper bound fits, global capacity cannot affect
+                // any decision. Merge disjoint gaps concurrently in read order.
+                // Near the global limit use the original ordered serial path.
+                if hits >= 4096
+                    && pool.current_num_threads() > 1
+                    && potential_bytes <= args.max_evidence_bytes.saturating_sub(total)
+                {
+                    for (read_index, found) in spans.into_iter().enumerate() {
+                        for (gap, span) in found {
+                            buckets[gap].push((read_index, span));
+                        }
+                    }
+                    pool.install(|| {
+                        evidence
+                            .par_iter_mut()
+                            .zip(buckets.par_iter_mut())
+                            .for_each(|(e, bucket)| {
+                                let mut local_total = e.bytes;
+                                for (read_index, span) in bucket.drain(..) {
+                                    e.add(span, &batch[read_index], args, &mut local_total);
+                                }
+                            })
+                    });
+                    total = evidence.iter().map(|e| e.bytes).sum();
+                } else {
+                    for (read, found) in batch.iter().zip(spans) {
+                        for (gap, span) in found {
+                            evidence[gap].add(span, read, args, &mut total);
+                        }
                     }
                 }
                 main_timings.merge += clock.elapsed().as_secs_f64();
@@ -409,7 +475,8 @@ fn decide(evidence: &mut Evidence, args: &Args) -> Result<Decision> {
             rejection: Some("msa_size_limit"),
         });
     }
-    let consensus = consensus::build(&mut evidence.sequences, args.preset)?;
+    let consensus =
+        consensus::build_with_backend(&mut evidence.sequences, args.preset, args.msa_backend)?;
     rejection = consensus.rejection;
     if rejection.is_none() && consensus.quality < args.min_quality {
         rejection = Some("low_msa_quality");
@@ -473,7 +540,7 @@ fn write_outputs(
         let mut writer = BufWriter::new(report_tmp.as_file_mut());
         writeln!(
             writer,
-            "# gapfil={} preset={:?} k={} minimizer={} min_reads={} min_quality_percent={} max_span={} max_reads_per_gap={} max_gap_bytes={} max_evidence_bytes={} max_msa_cells={}",
+            "# yagaf={} preset={:?} k={} minimizer={} min_reads={} min_quality_percent={} max_span={} max_reads_per_gap={} max_gap_bytes={} max_evidence_bytes={} max_msa_cells={} msa_backend={}",
             env!("CARGO_PKG_VERSION"),
             args.preset,
             args.k,
@@ -484,7 +551,8 @@ fn write_outputs(
             args.max_reads_per_gap,
             args.max_gap_bytes,
             args.max_evidence_bytes,
-            args.max_msa_cells
+            args.max_msa_cells,
+            args.msa_backend.name()
         )?;
         writeln!(
             writer,
@@ -550,7 +618,7 @@ pub fn run(args: &Args) -> Result<()> {
     let threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    let msa_threads = args.msa_threads.unwrap_or(threads.min(2)).min(threads);
+    let msa_threads = args.msa_threads.unwrap_or(threads).min(threads);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()?;
@@ -560,12 +628,11 @@ pub fn run(args: &Args) -> Result<()> {
     let mut gaps = discover(&scaffolds, args.k);
     mark_phase(&mut phases, &mut phase_clock, "gap_discovery");
     let m = args.minimizer.unwrap_or(args.k.min(15));
-    let index = Index::new(&gaps, args.k, m);
+    let mut index = pool.install(|| Index::new(&gaps, args.k, m));
     mark_phase(&mut phases, &mut phase_clock, "index_build");
-    index.reject_repeated_anchors(&scaffolds, &mut gaps);
+    pool.install(|| index.reject_repeated_anchors(&scaffolds, &mut gaps));
     mark_phase(&mut phases, &mut phase_clock, "anchor_uniqueness");
-    drop(index);
-    let index = Index::new(&gaps, args.k, m);
+    index.retain_eligible(&gaps);
     mark_phase(&mut phases, &mut phase_clock, "index_filter");
     eprintln!(
         "Indexed {} gaps ({} eligible) in {:.3}s; {} read workers, {} MSA workers",
@@ -590,7 +657,6 @@ pub fn run(args: &Args) -> Result<()> {
         )
     };
     drop(index);
-    drop(pool);
     eprintln!(
         "Scanned {} reads in {:.3}s",
         reads.records,
@@ -598,9 +664,16 @@ pub fn run(args: &Args) -> Result<()> {
     );
     mark_phase(&mut phases, &mut phase_clock, "read_scan");
     let msa_start = Instant::now();
-    let msa_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(msa_threads)
-        .build()?;
+    let smaller_pool = if msa_threads != threads {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(msa_threads)
+                .build()?,
+        )
+    } else {
+        None
+    };
+    let msa_pool = smaller_pool.as_ref().unwrap_or(&pool);
     let decisions: Vec<Decision> = msa_pool.install(|| {
         evidence
             .par_iter_mut()
@@ -613,6 +686,7 @@ pub fn run(args: &Args) -> Result<()> {
                     )
                 });
                 e.ids.clear();
+                e.id_index.clear();
                 e.sequences.clear();
                 decision
             })
@@ -665,4 +739,51 @@ pub fn run(args: &Args) -> Result<()> {
 fn mark_phase(phases: &mut Vec<(&'static str, f64)>, clock: &mut Instant, name: &'static str) {
     phases.push((name, clock.elapsed().as_secs_f64()));
     *clock = Instant::now();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colliding_read_id_hashes_keep_distinct_support_and_detect_conflicts() {
+        let args = Args::parse_from([
+            "yagaf",
+            "--scaffolds",
+            "scaffolds.fa",
+            "--reads",
+            "reads.fa",
+            "--output",
+            "output.fa",
+            "--report",
+            "gaps.tsv",
+            "--preset",
+            "hifi",
+            "--k",
+            "31",
+            "--min-reads",
+            "2",
+            "--min-quality",
+            "100",
+        ]);
+        let read = |id: &[u8]| Read {
+            id: Arc::from(id),
+            id_hash: 7,
+            sequence: Vec::new(),
+        };
+        let first = read(b"first");
+        let second = read(b"second");
+        let mut evidence = Evidence::default();
+        let mut total = 0;
+        evidence.add(Span::Sequence(b"A".to_vec()), &first, &args, &mut total);
+        evidence.add(Span::Sequence(b"C".to_vec()), &second, &args, &mut total);
+        evidence.add(Span::Sequence(b"C".to_vec()), &second, &args, &mut total);
+        assert_eq!(evidence.sequences.len(), 2);
+        assert_eq!(evidence.duplicate_ids, 1);
+        assert!(evidence.rejection.is_none());
+        evidence.add(Span::Sequence(b"T".to_vec()), &second, &args, &mut total);
+        assert_eq!(evidence.rejection, Some("conflicting_duplicate_read_id"));
+        assert_eq!(total, 0);
+        assert!(evidence.sequences.is_empty());
+    }
 }

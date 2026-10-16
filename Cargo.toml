@@ -1,9 +1,14 @@
 [package]
-name = "gapfil"
+name = "yagaf"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Conservative parallel long-read scaffold gap filling"
+autobins = false
+
+[[bin]]
+name = "yagaf"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -14,6 +19,7 @@ poasta = { path = "vendor/poasta" }
 rayon = "1.11"
 rustc-hash = "2.1"
 simd-minimizers = "=2.3.1"
+spoars = { path = "vendor/spoars", default-features = false }
 tempfile = "3.23"
 
 [dev-dependencies]
@@ -23,8 +29,20 @@ deko = { version = "=0.6.0", features = ["flate2", "zstd", "bzip2", "xz"], defau
 no-pdep = ["helicase/no-pdep"]
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 1
+debug = false
 
 [profile.dev]
 opt-level = 1

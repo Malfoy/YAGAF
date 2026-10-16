@@ -1,0 +1,14 @@
+[package]
+name = "spoars"
+version = "0.1.4"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+autobins = false
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }

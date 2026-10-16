@@ -3,7 +3,6 @@
 //! Every FASTA read goes through helicase.
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use gapfil::{discover, input, is_base, revcomp};
 use rustc_hash::FxHashSet;
 use std::{
     collections::BTreeMap,
@@ -13,6 +12,7 @@ use std::{
     process::Command,
     time::Instant,
 };
+use yagaf::{discover, input, is_base, revcomp};
 
 #[derive(Parser, Debug)]
 struct Options {
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
         .unwrap()
         .parent()
         .unwrap()
-        .join("gapfil");
+        .join("yagaf");
     let rss = options.directory.join("peak_rss_kib.txt");
     let start = Instant::now();
     let process = Command::new("/usr/bin/time")
@@ -236,10 +236,10 @@ fn main() -> Result<()> {
         ])
         .output()?;
     let seconds = start.elapsed().as_secs_f64();
-    fs::write(options.directory.join("gapfil.stderr.log"), &process.stderr)?;
+    fs::write(options.directory.join("yagaf.stderr.log"), &process.stderr)?;
     ensure!(
         process.status.success(),
-        "Gapfil failed: {}",
+        "YAGAF failed: {}",
         String::from_utf8_lossy(&process.stderr)
     );
     let corrected = input::scaffolds(&options.directory.join("corrected.fa"))?;

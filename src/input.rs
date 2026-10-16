@@ -32,14 +32,14 @@ pub fn scaffolds(path: &Path) -> Result<Vec<Scaffold>> {
         );
         records.push(Scaffold {
             header: parser.get_header().to_vec(),
-            sequence: parser.get_dna_string().to_vec(),
+            sequence: parser.get_dna_string_owned(),
         });
     }
     ensure!(!records.is_empty(), "No scaffold records");
     Ok(records)
 }
 
-/// Also used for POASTA's in-memory MSA export. All FASTA parsing stays in helicase.
+/// Parse in-memory FASTA through the same helicase configuration as file input.
 pub fn fasta_bytes(data: &[u8]) -> Result<Vec<Scaffold>> {
     ensure!(!data.is_empty(), "Empty FASTA buffer");
     let mut parser = FastxParser::<CONFIG>::from_slice(data)?;
