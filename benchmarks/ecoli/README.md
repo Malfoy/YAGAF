@@ -114,3 +114,15 @@ target/release/examples/recovery_bench \
 
 Use a new run directory, switch the reference for W3110, and set `--mask-count 1000`
 for the sparse control. `/usr/bin/time` is used to record peak process RSS on Linux.
+
+## Repeated assembly anchors
+
+The assembly-wide individual-anchor uniqueness filter has been removed. These
+results use shared defaults (k=31, minimum 3 reads, minimum 50% unanimity), all
+prepared input datasets above, and 32 workers. `assembly-repeat-validation.tsv`
+records the new recovery check. MG1655 recovered 94.40% / 82.88% of masked bases
+for 1,000 / 10,000 masks; W3110 recovered 92.30% / 82.88%. There was one incorrect
+fill in MG1655/10,000: original interval [736839,736840) received a 381-base
+consensus (3 reads, 99.21465969% unanimous columns). The other three cases had
+zero incorrect fills. Read-local pairing checks and acceptance thresholds remain
+unchanged. Assembly repeats can create a coherent consensus from another locus.

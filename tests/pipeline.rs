@@ -183,13 +183,40 @@ fn repeated_read_ids_do_not_inflate_support() {
 }
 
 #[test]
-fn repeated_scaffold_anchors_are_rejected() {
+fn repeated_scaffold_anchors_remain_eligible() {
     let f = Fixture::new();
-    f.write_scaffolds(&[f.span(b"NNN"), f.left.clone()]);
+    let repeated = joined(&[&f.left, b"ACGT", &revcomp(&f.right)]);
+    f.write_scaffolds(&[f.span(b"NNN"), repeated.clone()]);
     f.reads(&[b"ACTG", b"ACTG", b"ACTG"]);
     run(&f.args("repeat", &[])).unwrap();
-    assert!(f.report("repeat").contains("nonunique_scaffold_anchor"));
-    assert_eq!(f.output("repeat")[0].sequence, f.span(b"NNN"));
+    assert!(f.report("repeat").contains("\tfilled\taccepted"));
+    assert_eq!(f.output("repeat")[0].sequence, f.span(b"ACTG"));
+    assert_eq!(f.output("repeat")[1].sequence, repeated);
+}
+
+#[test]
+fn shared_assembly_flanks_keep_gap_evidence_separate() {
+    let f = Fixture::new();
+    let mut seed = 721432194213;
+    let other_right = dna(&mut seed, 23);
+    f.write_scaffolds(&[f.span(b"NNN"), joined(&[&f.left, b"NNNN", &other_right])]);
+    let mut reads = Vec::new();
+    for i in 0..3 {
+        reads.push((format!("a{i}"), f.span(b"ACTG")));
+        reads.push((
+            format!("b{i}"),
+            revcomp(&joined(&[&f.left, b"GGTTAC", &other_right])),
+        ));
+    }
+    f.write_reads(&reads);
+    run(&f.args("shared", &[])).unwrap();
+    let output = f.output("shared");
+    assert_eq!(output[0].sequence, f.span(b"ACTG"));
+    assert_eq!(
+        output[1].sequence,
+        joined(&[&f.left, b"GGTTAC", &other_right])
+    );
+    assert_eq!(f.report("shared").matches("\tfilled\taccepted").count(), 2);
 }
 
 #[test]

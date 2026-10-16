@@ -5,8 +5,8 @@ Conservative, parallel scaffold gap filling in Rust using long reads.
 YAGAF finds each `N`/`n` run, takes one immediately adjacent k-mer per side, and
 adapts K2Rmini's multi-query minimizer/k-mer indexing to find spanning reads in one
 streamed pass. Exact bases, strand, order, and unique pairing are verified after
-hash matches. Both anchors must also be unique across the scaffold input, considering
-both strands. Unsupported or ambiguous gaps remain unchanged.
+hash matches. Flanking k-mers may repeat elsewhere in the assembly. Ambiguous
+pairings within a read are excluded. Unsupported gaps remain unchanged.
 
 Spans are oriented to the scaffold and aligned with the vendored POASTA Rust
 library. The consensus is the unique majority symbol in each MSA column, including

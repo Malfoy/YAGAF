@@ -1,6 +1,6 @@
 // Adapted from Malfoy/K2Rmini src/bin/k2rminimulti.rs (GPL-3.0).
 // Pinned upstream revision and adaptation details are in THIRD_PARTY.md.
-use crate::{Gap, Scaffold, is_base, revcomp};
+use crate::{Gap, is_base, revcomp};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use simd_minimizers::minimizers;
@@ -127,17 +127,6 @@ impl Index {
         index
     }
 
-    /// Preserve anchor IDs and remove rejected postings without recomputing
-    /// minimizers or k-mer hashes for the surviving anchors.
-    pub fn retain_eligible(&mut self, gaps: &[Gap]) {
-        for postings in self.minis.values_mut().chain(self.kmers.values_mut()) {
-            postings.retain(|&id| gaps[self.anchors[id].gap].rejection.is_none());
-        }
-        self.minis.retain(|_, postings| !postings.is_empty());
-        self.kmers.retain(|_, postings| !postings.is_empty());
-        self.use_offsets = self.m >= 9 && self.minis.values().all(|postings| postings.len() <= 64);
-    }
-
     // Each ACTG run is independent. Never join across an ambiguous base: that
     // would introduce nonexistent k-mers and corrupt read coordinates.
     fn visit(&self, sequence: &[u8], buffers: &mut Buffers, mut found: impl FnMut(usize, usize)) {
@@ -205,52 +194,6 @@ impl Index {
                 }
             }
             offset += run.len() + 1;
-        }
-    }
-
-    /// Strictly require each flank to occur once in the assembly, considering
-    /// both strands. This costs an in-memory assembly scan, never a read rescan.
-    pub fn reject_repeated_anchors(&self, scaffolds: &[Scaffold], gaps: &mut [Gap]) {
-        const CHUNK: usize = 262_144;
-        let jobs: Vec<_> = scaffolds
-            .iter()
-            .flat_map(|scaffold| {
-                (0..scaffold.sequence.len()).step_by(CHUNK).map(|start| {
-                    let end = (start + CHUNK).min(scaffold.sequence.len());
-                    let overlap_end = (end + self.k - 1).min(scaffold.sequence.len());
-                    (&scaffold.sequence[start..overlap_end], end - start)
-                })
-            })
-            .collect();
-        let (_, counts) = jobs
-            .into_par_iter()
-            .fold(
-                || (Buffers::default(), vec![0u8; self.anchors.len()]),
-                |(mut buffers, mut counts), (sequence, owned)| {
-                    self.visit(sequence, &mut buffers, |id, pos| {
-                        if pos < owned {
-                            counts[id] = counts[id].saturating_add(1).min(2);
-                        }
-                    });
-                    (buffers, counts)
-                },
-            )
-            .reduce(
-                || (Buffers::default(), vec![0u8; self.anchors.len()]),
-                |(buffers, mut a), (_, b)| {
-                    for (left, right) in a.iter_mut().zip(b) {
-                        *left = (*left + right).min(2);
-                    }
-                    (buffers, a)
-                },
-            );
-        for ids in (0..self.anchors.len()).step_by(2) {
-            let anchor = &self.anchors[ids];
-            let palindrome = anchor.bases == self.anchors[ids + 1].bases;
-            let occurrences = counts[ids] + if palindrome { 0 } else { counts[ids + 1] };
-            if occurrences != 1 {
-                gaps[anchor.gap].rejection = Some("nonunique_scaffold_anchor");
-            }
         }
     }
 

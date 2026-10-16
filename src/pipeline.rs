@@ -761,15 +761,11 @@ pub fn run(args: &Args) -> Result<()> {
     mark_phase(&mut phases, &mut phase_clock, "setup");
     let scaffolds = input::scaffolds(&args.scaffolds)?;
     mark_phase(&mut phases, &mut phase_clock, "scaffold_read");
-    let mut gaps = discover(&scaffolds, args.k);
+    let gaps = discover(&scaffolds, args.k);
     mark_phase(&mut phases, &mut phase_clock, "gap_discovery");
     let m = args.minimizer.unwrap_or(args.k.min(15));
-    let mut index = pool.install(|| Index::new(&gaps, args.k, m));
+    let index = pool.install(|| Index::new(&gaps, args.k, m));
     mark_phase(&mut phases, &mut phase_clock, "index_build");
-    pool.install(|| index.reject_repeated_anchors(&scaffolds, &mut gaps));
-    mark_phase(&mut phases, &mut phase_clock, "anchor_uniqueness");
-    index.retain_eligible(&gaps);
-    mark_phase(&mut phases, &mut phase_clock, "index_filter");
     eprintln!(
         "Indexed {} gaps ({} eligible) in {:.3}s; {} read workers, {} MSA workers",
         gaps.len(),

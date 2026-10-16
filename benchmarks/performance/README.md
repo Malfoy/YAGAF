@@ -1,5 +1,9 @@
 # Initial performance measurements
 
+Historical measurements below used an assembly-wide anchor uniqueness filter.
+That filter has since been removed; repeated assembly anchors are now allowed.
+
+
 This report compares the first optimization (`a4d0d9d`) against `5c92e89`.
 See [parallel parsing](parallel-parsing/README.md) for the next optimization and
 shared CLI defaults.

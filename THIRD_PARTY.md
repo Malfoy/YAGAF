@@ -15,7 +15,8 @@ YAGAF is GPL-3.0-only; the full license is in `LICENSE`.
   actual bases and positions, and extracts one interval per uniquely paired gap.
   Minimizer-offset postings locate candidate starts directly, with full k-mer
   hashing retained for short minimizers or large posting lists. Index construction
-  and assembly uniqueness checks run in parallel. Each ACTG run is processed independently; ambiguous bases are never removed to
+  runs in parallel; repeated assembly anchors remain indexed for every gap. Each
+  ACTG run is processed independently; ambiguous bases are never removed to
   concatenate unrelated sequence runs. Reverse complements are indexed explicitly.
 
 ## POASTA

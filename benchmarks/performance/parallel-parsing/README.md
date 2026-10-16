@@ -1,5 +1,9 @@
 # Parallel parsing and shared CLI defaults
 
+Historical measurements below used an assembly-wide anchor uniqueness filter.
+That filter has since been removed; repeated assembly anchors are now allowed.
+
+
 Measured 2026-10-16 on the same i9-13950HX, native release builds, 32 read/MSA
 workers, warm cached input. Baseline is commit `a4d0d9d`. Nine repetitions per
 dataset alternate baseline/current order; no compilations or other benchmarks

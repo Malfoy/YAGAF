@@ -3,3 +3,7 @@
 /vendor/K2Rmini/.git/
 /benchmarks/ecoli/references/
 /benchmarks/ecoli/runs/
+
+/results/
+/reads.fa.gz
+/scafolds.fa.gz
