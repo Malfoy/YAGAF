@@ -112,8 +112,8 @@ pub fn build(sequences: &mut [Vec<u8>], preset: Preset) -> Result<Consensus> {
     build_with_backend(sequences, preset, MsaBackend::Poasta)
 }
 
-pub fn build_with_backend(
-    sequences: &mut [Vec<u8>],
+pub fn build_with_backend<S: AsRef<[u8]>>(
+    sequences: &mut [S],
     preset: Preset,
     backend: MsaBackend,
 ) -> Result<Consensus> {
@@ -121,13 +121,16 @@ pub fn build_with_backend(
     ensure!(
         sequences
             .iter()
-            .all(|s| !s.is_empty() && s.iter().all(|&b| is_base(b))),
+            .all(|s| !s.as_ref().is_empty() && s.as_ref().iter().all(|&b| is_base(b))),
         "Invalid consensus evidence"
     );
-    if sequences.iter().all(|s| s == &sequences[0]) {
-        let len = sequences[0].len();
+    if sequences
+        .iter()
+        .all(|s| s.as_ref() == sequences[0].as_ref())
+    {
+        let len = sequences[0].as_ref().len();
         return Ok(Consensus {
-            sequence: sequences[0].clone(),
+            sequence: sequences[0].as_ref().to_vec(),
             unanimous: len,
             columns: len,
             quality: 100.0,
@@ -135,7 +138,7 @@ pub fn build_with_backend(
         });
     }
     // Stable lexical order makes progressive POA independent of worker scheduling.
-    sequences.sort_unstable();
+    sequences.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
     let rows = match backend {
         MsaBackend::Poasta => poasta_rows(sequences, preset)?,
         MsaBackend::Spoars => spoars_rows(sequences, preset, true)?,
@@ -145,10 +148,11 @@ pub fn build_with_backend(
     from_rows(&rows)
 }
 
-fn poasta_rows(sequences: &[Vec<u8>], preset: Preset) -> Result<Vec<Vec<u8>>> {
+fn poasta_rows<S: AsRef<[u8]>>(sequences: &[S], preset: Preset) -> Result<Vec<Vec<u8>>> {
     let aligner = PoastaAligner::new(AffineMinGapCost(preset.costs()), AlignmentType::Global);
     let mut graph = POAGraph::<u32>::new();
     for (id, sequence) in sequences.iter().enumerate() {
+        let sequence = sequence.as_ref();
         let weights = vec![1; sequence.len()];
         if id == 0 {
             graph.add_alignment_with_weights(&id.to_string(), sequence, None, &weights)?;
@@ -165,7 +169,11 @@ fn poasta_rows(sequences: &[Vec<u8>], preset: Preset) -> Result<Vec<Vec<u8>>> {
     Ok(poa_graph_to_msa(&graph)?)
 }
 
-fn spoars_rows(sequences: &[Vec<u8>], preset: Preset, simd: bool) -> Result<Vec<Vec<u8>>> {
+fn spoars_rows<S: AsRef<[u8]>>(
+    sequences: &[S],
+    preset: Preset,
+    simd: bool,
+) -> Result<Vec<Vec<u8>>> {
     use poasta::aligner::scoring::AlignmentCosts;
     use spoars::align::{AlignmentEngine, AlignmentType as Mode, Scoring, SimdEngine, SisdEngine};
     let costs = preset.costs();
@@ -176,6 +184,7 @@ fn spoars_rows(sequences: &[Vec<u8>], preset: Preset, simd: bool) -> Result<Vec<
     let mut graph = spoars::graph::Graph::new();
     let mut add = |engine: &mut dyn AlignmentEngine| -> Result<()> {
         for sequence in sequences {
+            let sequence = sequence.as_ref();
             let (alignment, _) = engine.align(sequence, &graph);
             graph.add_alignment_weight(&alignment, sequence, 1)?;
         }
@@ -193,7 +202,7 @@ fn spoars_rows(sequences: &[Vec<u8>], preset: Preset, simd: bool) -> Result<Vec<
         .collect())
 }
 
-fn validate_rows(rows: &[Vec<u8>], sequences: &[Vec<u8>]) -> Result<()> {
+fn validate_rows<S: AsRef<[u8]>>(rows: &[Vec<u8>], sequences: &[S]) -> Result<()> {
     ensure!(rows.len() == sequences.len(), "MSA is missing sequences");
     // Each backend must preserve every contributing sequence and its gaps.
     for (row, original) in rows.iter().zip(sequences.iter()) {
@@ -201,7 +210,7 @@ fn validate_rows(rows: &[Vec<u8>], sequences: &[Vec<u8>]) -> Result<()> {
             row.iter()
                 .filter(|&&b| b != b'-')
                 .copied()
-                .eq(original.iter().copied()),
+                .eq(original.as_ref().iter().copied()),
             "MSA did not preserve input sequence"
         );
     }
@@ -211,6 +220,45 @@ fn validate_rows(rows: &[Vec<u8>], sequences: &[Vec<u8>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_and_heap_evidence_produce_the_same_msa_metrics() {
+        for length in [16, 17, 49] {
+            let truth: Vec<_> = (0..length).map(|i| b"ACGT"[i % 4]).collect();
+            let mut insertion = truth.clone();
+            insertion.insert(length / 2, b'A');
+            for backend in [
+                MsaBackend::Poasta,
+                MsaBackend::Spoars,
+                MsaBackend::SpoarsScalar,
+            ] {
+                for preset in [Preset::Hifi, Preset::Ont] {
+                    let mut heap = vec![truth.clone(), insertion.clone(), truth.clone()];
+                    let mut inline: Vec<_> = heap
+                        .iter()
+                        .map(|s| crate::index::Sequence::from_slice(s))
+                        .collect();
+                    let expected = build_with_backend(&mut heap, preset, backend).unwrap();
+                    let actual = build_with_backend(&mut inline, preset, backend).unwrap();
+                    assert_eq!(actual.sequence, expected.sequence);
+                    assert_eq!(
+                        (
+                            actual.unanimous,
+                            actual.columns,
+                            actual.quality,
+                            actual.rejection
+                        ),
+                        (
+                            expected.unanimous,
+                            expected.columns,
+                            expected.quality,
+                            expected.rejection
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn alternate_backends_preserve_spans_and_the_quality_definition() {

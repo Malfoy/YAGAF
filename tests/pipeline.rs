@@ -388,7 +388,7 @@ fn invalid_arguments_and_existing_outputs_fail_without_writing() {
     run(&f.args("exists", &[])).unwrap();
     assert!(run(&f.args("exists", &[])).is_err());
     let mut args = f.args("same", &[]);
-    args.report = args.output.clone();
+    args.report = Some(args.output.clone());
     assert!(run(&args).is_err());
     let mut args = f.args("input", &[]);
     args.output = args.scaffolds.clone();
@@ -402,11 +402,11 @@ fn malformed_fastq_and_oversized_reads_fail_before_outputs() {
     let mut args = f.args("badq", &[]);
     args.reads = f.dir.path().join("bad.fq");
     assert!(run(&args).is_err());
-    assert!(!args.output.exists() && !args.report.exists());
+    assert!(!args.output.exists() && !args.report_path().exists());
     f.reads(&[b"ACTG", b"ACTG", b"ACTG"]);
     let args = f.args("oversized", &["--max-read-bases", "40", "--max-span", "8"]);
     assert!(run(&args).is_err());
-    assert!(!args.output.exists() && !args.report.exists());
+    assert!(!args.output.exists() && !args.report_path().exists());
 }
 
 #[test]
@@ -441,11 +441,11 @@ fn simd_filter_matches_exact_search_across_k_sizes_and_ambiguous_runs() {
                 let found = index.extract(&read, &mut Scanner::default(), 1000);
                 if let Some((start, end)) = forward.filter(|_| reverse.is_none()) {
                     assert!(
-                        matches!(&found[..],[(0,Span::Sequence(seq))] if *seq==read[start..end])
+                        matches!(&found[..],[(0,Span::Sequence(seq))] if seq.as_slice()==&read[start..end])
                     );
                 } else if let Some((start, end)) = reverse.filter(|_| forward.is_none()) {
                     assert!(
-                        matches!(&found[..],[(0,Span::Sequence(seq))] if *seq==revcomp(&read[start..end]))
+                        matches!(&found[..],[(0,Span::Sequence(seq))] if seq.as_slice()==revcomp(&read[start..end]))
                     );
                 }
             }
@@ -477,4 +477,104 @@ fn exact_interval(read: &[u8], left: &[u8], right: &[u8]) -> Option<(usize, usiz
         .map(|(p, _)| p)
         .collect();
     (l.len() == 1 && r.len() == 1 && l[0] + left.len() < r[0]).then(|| (l[0] + left.len(), r[0]))
+}
+
+#[test]
+fn shared_defaults_and_automatic_report_work_with_three_required_paths() {
+    let f = Fixture::new();
+    let mut seed = 819241;
+    let left = dna(&mut seed, 31);
+    let right = dna(&mut seed, 31);
+    f.write_scaffolds(&[joined(&[&left, b"NNN", &right])]);
+    let read = joined(&[&left, b"ACTGAC", &right]);
+    f.write_reads(&[
+        ("a".into(), read.clone()),
+        ("b".into(), read.clone()),
+        ("c".into(), read.clone()),
+    ]);
+    let args = Args::parse_from([
+        "yagaf".into(),
+        "--scaffolds".into(),
+        f.dir.path().join("scaffolds.fa").into_os_string(),
+        "--reads".into(),
+        f.dir.path().join("reads.fa").into_os_string(),
+        "--output".into(),
+        f.dir.path().join("defaults.fa").into_os_string(),
+    ]);
+    run(&args).unwrap();
+    assert_eq!(f.output("defaults")[0].sequence, read);
+    assert_eq!(
+        args.report_path(),
+        f.dir.path().join("defaults.fa.gaps.tsv")
+    );
+    let report = fs::read_to_string(args.report_path()).unwrap();
+    assert!(report.contains("min_reads=3 min_quality_percent=50"));
+    assert!(report.contains("msa_backend=poasta"));
+    assert!(run(&args).is_err());
+    for scoring in ["hifi", "ont"] {
+        let a = Args::parse_from([
+            "yagaf", "-s", "s.fa", "-r", "r.fa", "-o", "o.fa", "--preset", scoring,
+        ]);
+        assert_eq!((a.k, a.min_reads, a.min_quality), (31, 3, 50.0));
+        assert!(matches!(
+            a.msa_backend,
+            yagaf::consensus::MsaBackend::Poasta
+        ));
+    }
+}
+
+#[test]
+fn mapped_and_streamed_parsers_match_across_record_boundaries() {
+    let f = Fixture::new();
+    let middle = b"ACGTACGTTGCAACGTTACGATCGATGCTAGCTACGATCGT";
+    let mut seed = 721937127397;
+    for fastq in [false, true] {
+        let path = f.dir.path().join("reads.input");
+        let mut file = fs::File::create(&path).unwrap();
+        for i in 0..120 {
+            let padding = dna(&mut seed, if i == 0 { 80_000 } else { 1024 + i });
+            let seq = joined(&[&padding, &f.span(middle), b"NN"]);
+            let seq = if i % 2 == 0 { seq } else { revcomp(&seq) };
+            writeln!(
+                file,
+                "{}r{} description > @@++",
+                if fastq { '@' } else { '>' },
+                i % 100
+            )
+            .unwrap();
+            if fastq {
+                writeln!(file, "{}\n+", String::from_utf8_lossy(&seq)).unwrap();
+                let qualities: String =
+                    (0..seq.len()).map(|p| b"@>+IACGT"[p % 8] as char).collect();
+                writeln!(file, "{qualities}").unwrap();
+            } else {
+                for line in seq.chunks(79) {
+                    writeln!(file, "{}", String::from_utf8_lossy(line)).unwrap();
+                }
+            }
+        }
+        drop(file);
+        let label = if fastq { "fastq" } else { "fasta" };
+        let mut mapped = f.args(
+            &format!("mapped-{label}"),
+            &["--threads", "32", "--batch-bases", "65536"],
+        );
+        mapped.reads = path.clone();
+        let mut streamed = f.args(
+            &format!("streamed-{label}"),
+            &["--threads", "1", "--stream-reads", "--batch-bases", "65536"],
+        );
+        streamed.reads = path;
+        run(&mapped).unwrap();
+        run(&streamed).unwrap();
+        assert_eq!(
+            f.output(&format!("mapped-{label}"))[0].sequence,
+            f.span(middle)
+        );
+        assert_eq!(
+            f.report(&format!("mapped-{label}")),
+            f.report(&format!("streamed-{label}"))
+        );
+        assert!(f.report(&format!("mapped-{label}")).contains("\t20\t100\t"));
+    }
 }

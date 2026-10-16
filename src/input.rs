@@ -17,6 +17,20 @@ pub fn open(path: &Path) -> Result<FastxParser<'static, CONFIG>> {
         .with_context(|| format!("Cannot open FASTA/FASTQ {}", path.display()))
 }
 
+/// Map regular, uncompressed files; codecs remain on the streamed reader path.
+pub fn mmap_uncompressed(path: &Path) -> Result<Option<MmapInput<'static>>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Ok(None);
+    }
+    let mut input = FileInput::new(path)?;
+    if input.is_compressed()? {
+        Ok(None)
+    } else {
+        Ok(Some(MmapInput::new(path)?))
+    }
+}
+
 pub fn scaffolds(path: &Path) -> Result<Vec<Scaffold>> {
     let mut parser = open(path)?;
     ensure!(

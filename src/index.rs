@@ -6,6 +6,9 @@ use rustc_hash::FxHashMap;
 use simd_minimizers::minimizers;
 use simd_minimizers::packed_seq::{PackedSeqVec, Seq, SeqVec};
 use simd_minimizers::seq_hash::{KmerHasher, NtHasher};
+use smallvec::SmallVec;
+
+pub type Sequence = SmallVec<[u8; 16]>;
 
 struct Anchor {
     gap: usize,
@@ -45,7 +48,7 @@ pub struct Scanner {
 
 #[derive(Debug)]
 pub enum Span {
-    Sequence(Vec<u8>),
+    Sequence(Sequence),
     AmbiguousPair,
     Rejected(&'static str),
 }
@@ -291,11 +294,21 @@ impl Index {
             } else if !sequence[start..end].iter().all(|&b| is_base(b)) {
                 Span::Rejected("ambiguous_read_span")
             } else {
-                Span::Sequence(if reverse {
-                    revcomp(&sequence[start..end])
-                } else {
-                    sequence[start..end].to_ascii_uppercase()
-                })
+                let mut bases = Sequence::from_slice(&sequence[start..end]);
+                bases.make_ascii_uppercase();
+                if reverse {
+                    bases.reverse();
+                    for base in &mut bases {
+                        *base = match *base {
+                            b'A' => b'T',
+                            b'C' => b'G',
+                            b'G' => b'C',
+                            b'T' => b'A',
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                Span::Sequence(bases)
             };
             result.push((gap, span));
         }

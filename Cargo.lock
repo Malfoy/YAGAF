@@ -926,6 +926,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "simd-minimizers",
+ "smallvec",
  "spoars",
  "tempfile",
 ]

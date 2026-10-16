@@ -32,22 +32,22 @@ Pinned upstream sources, adaptations, and licenses are described in
 
 ## Run
 
-Choose `--preset hifi` or `--preset ont`, and explicitly provide `--k`,
-`--min-reads`, and `--min-quality`. There are no implicit acceptance thresholds.
-For example, this illustrates a strict configuration; these values are **not
-validated recommendations**:
+Only scaffold, read, and corrected-output paths are required. Shared defaults are
+`k=31`, a minimum of 3 independent reads, and at least 50% unanimous MSA columns.
+All available CPU workers are used. These settings apply independently of read
+technology. Override any setting when needed:
 
 ```sh
 target/release/yagaf \
   --scaffolds scaffolds.fa --reads reads.fq.gz \
-  --output corrected.fa --report gaps.tsv \
-  --preset hifi --k 31 --min-reads 5 --min-quality 100 \
-  --threads 32
+  --output corrected.fa
 ```
 
 FASTA scaffolds and FASTA/FASTQ reads may be uncompressed, gzip (`.gz`), zstd
 (`.zst`), bzip2 (`.bz`/`.bz2`), or xz (`.xz`). Compression is detected from file
 contents, independently of the filename extension; no format flags are needed.
+The report defaults to `OUTPUT.gaps.tsv`; use `--report` to set another path.
+`-h` shows basic options, while `--help` includes all advanced overrides.
 Paths must refer to files; stdin/stdout streaming is not yet exposed. Both output
 paths must be new files in existing directories. Input files are never overwritten.
 Headers, record order, and all bases outside replaced gaps are preserved, including
@@ -59,10 +59,13 @@ use the same unanimity metric and conservative acceptance rules.
 
 Add `--timings phases.tsv` to save phase timings. The TSV separates sequential
 wall-time phases from overlapping parser, extraction, and evidence-merge timings;
-overlapping values should not be added to the total. Phase times are also logged
-to stderr. The timing output must be a new file separate from the other outputs.
+overlapping values should not be added to the total. In mapped mode,
+`read_parse_active` measures producer framing, and `read_extraction` includes worker
+parsing and span extraction. Phase times are also logged to stderr. The timing output must be a new file separate from the other outputs.
 
-The two presets initially change global affine alignment penalties:
+The optional legacy `--preset hifi|ont` flag changes only global affine alignment
+penalties; `hifi` scoring is the default. It does not change k, backend, acceptance
+thresholds, or resource settings:
 
 | Preset | Mismatch | Gap open | Gap extend |
 | --- | ---: | ---: | ---: |
@@ -103,7 +106,13 @@ rejections are excluded from the read index and have zero candidate counts.
 ## Resource controls
 
 Read scanning uses bounded batches, a two-batch producer queue, and a shared
-immutable index. Extraction runs in parallel. Evidence merges across independent gaps in parallel,
+immutable index. Uncompressed regular read files use helicase record framing
+followed by parallel helicase parsing and span extraction from a read-only memory
+map. Complete read sequences stay local to each parser; only extracted spans and
+read IDs enter the evidence pipeline. Spans of up to 16 bases use inline storage.
+Compressed inputs use streamed helicase parsing. `--stream-reads` forces that path
+for uncompressed inputs too, reducing mapped-file RSS. Keep mapped inputs unchanged
+while the program runs. Evidence merges across independent gaps in parallel,
 preserving each gap's read order. Near the global memory limit, merging follows
 input order serially so capacity decisions remain deterministic.
 Independent MSAs use the configured thread count by default; use
@@ -117,7 +126,7 @@ sorted so results do not depend on worker scheduling or batch boundaries.
 | `--max-gap-bytes` | 4 MiB | Retained sequence + read-ID bytes per gap |
 | `--max-evidence-bytes` | 512 MiB | Retained evidence payload across all gaps |
 | `--max-msa-cells` | 20,000,000 | Bound `sum(span lengths) × max(span length)` before nontrivial MSA |
-| `--batch-bases` | 16 MiB | Target batch bytes, counting sequences and IDs |
+| `--batch-bases` | 16 MiB | Target batch bytes (encoded bytes for mapped input; sequence + ID bytes when streaming) |
 | `--max-read-bases` | 10,000,000 | Fail run on oversized read |
 
 These are computational guardrails, not biological length filters. If a gap crosses
@@ -126,6 +135,8 @@ kept. Global capacity decisions follow input order. They can therefore differ wh
 the read file is reordered, while remaining reproducible across worker counts.
 Limits do not constitute a hard RSS cap: scaffolds, index/postings, record buffers,
 temporary extraction results, allocator overhead, and POASTA states also use memory.
+Mapped input pages also contribute to RSS, so mapped-mode peak RSS can be larger
+than with `--stream-reads`, particularly for warm cached input.
 Helicase must parse a complete record before the read-size check. Individual
 scaffolds are currently limited to `2^31-1` bases by the indexing implementation.
 

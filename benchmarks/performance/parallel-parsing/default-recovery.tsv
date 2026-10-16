@@ -1,0 +1,5 @@
+strain	masked_bases	gap_runs	exact_filled_gaps	wrong_filled_gaps	correct_recovered_bases	wrong_recovered_bases	unchanged_masked_bases	recovery_percent
+mg1655	1000	999	927	0	928	0	72	92.800000
+mg1655	10000	9987	8162	0	8175	0	1825	81.750000
+w3110	1000	1000	911	0	911	0	89	91.100000
+w3110	10000	9986	8136	0	8146	0	1854	81.460000

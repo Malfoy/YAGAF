@@ -19,6 +19,7 @@ poasta = { path = "vendor/poasta" }
 rayon = "1.11"
 rustc-hash = "2.1"
 simd-minimizers = "=2.3.1"
+smallvec = { version = "1.16", features = ["union"] }
 spoars = { path = "vendor/spoars", default-features = false }
 tempfile = "3.23"
 

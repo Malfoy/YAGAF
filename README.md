@@ -4,19 +4,17 @@ Conservative, parallel long-read scaffold gap filling in Rust.
 
 ```sh
 cargo build --release --locked
-
-target/release/yagaf \
-  --scaffolds scaffolds.fa --reads reads.fq.gz \
-  --output corrected.fa --report gaps.tsv \
-  --preset hifi --k 31 --min-reads 5 --min-quality 100 --threads 32
+target/release/yagaf -s scaffolds.fa -r reads.fq.gz -o corrected.fa
 ```
 
-Use `--preset hifi` or `ont`. Choose `k`, minimum read support, and minimum
-percentage of unanimous MSA columns explicitly. Unsupported gaps stay unchanged.
+Defaults: **k=31**, **3 independent reads**, **50% unanimous MSA columns**, and all
+available CPU threads. The report is `corrected.fa.gaps.tsv`. Unsupported gaps stay
+unchanged. All settings can be overridden.
 
 All sequence input uses **helicase**, with automatic gzip, zstd, bzip2, and xz
-detection. **POASTA** is the default MSA engine; `--msa-backend spoars` selects
-native Rust SIMD POA. `--timings phases.tsv` saves phase runtimes.
+detection. POASTA is the default MSA engine; `--msa-backend spoars` selects native
+Rust SIMD POA. `--timings phases.tsv` saves phase runtimes.
 
 Build on the target machine for native CPU optimization. Output files must be new.
-See `yagaf --help`, [usage](docs/usage.md), and [licenses](THIRD_PARTY.md).
+Use `-h` for basic options or `--help` for all overrides. See [usage](docs/usage.md)
+and [licenses](THIRD_PARTY.md).

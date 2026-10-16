@@ -1,0 +1,4 @@
+rustc=rustc 1.97.0 (2d8144b78 2026-07-07)
+baseline_commit=a4d0d9d0a5da60376702badd3db2f2e76b1c7d22
+baseline_binary_sha256=80f58dd005225c1a5502eccbb66f5294bd842ff2921a46cd867dc7bd0340a7d8
+optimized_binary_sha256=c554dfb29db61dee2df335c14d482bf349c521c5917f9c1306b1781dc29bb26c

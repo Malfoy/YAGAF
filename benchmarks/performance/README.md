@@ -1,4 +1,8 @@
-# Performance measurements
+# Initial performance measurements
+
+This report compares the first optimization (`a4d0d9d`) against `5c92e89`.
+See [parallel parsing](parallel-parsing/README.md) for the next optimization and
+shared CLI defaults.
 
 Measured 2026-10-16 on Intel Core i9-13950HX (24 cores, 32 logical CPUs), Linux,
 native release builds. Runs execute serially with 32 read and 32 MSA workers.

@@ -2,19 +2,22 @@ use crate::{
     Gap, Scaffold,
     consensus::{self, Consensus, MsaBackend, Preset},
     discover,
-    index::{Index, Scanner, Span},
+    index::{Index, Scanner, Sequence, Span},
     input,
 };
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use crossbeam_channel::bounded;
-use helicase::HelicaseParser;
-use helicase::parser::Format;
+use helicase::input::{FromSlice, InputData};
+use helicase::parser::{Event, Format};
+use helicase::{FastxParser, HelicaseParser, ParserOptions};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::hash::Hasher;
 use std::io::{BufWriter, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,60 +39,74 @@ pub struct Args {
     /// Corrected FASTA; must not already exist
     #[arg(short, long)]
     pub output: PathBuf,
-    /// Per-gap TSV report; must not already exist
+    /// Per-gap TSV report (default: OUTPUT.gaps.tsv); must not already exist
     #[arg(long)]
-    pub report: PathBuf,
+    pub report: Option<PathBuf>,
     /// Optional per-phase timing TSV; must not already exist
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub timings: Option<PathBuf>,
     /// Read technology; selects initial MSA scoring, not acceptance thresholds
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "hifi", hide_short_help = true)]
     pub preset: Preset,
     /// MSA implementation; alternative engines are available for comparison
-    #[arg(long, value_enum, default_value = "poasta")]
+    #[arg(long, value_enum, default_value = "poasta", hide_short_help = true)]
     pub msa_backend: MsaBackend,
     /// One adjacent anchor of this length on each side (3..=63)
-    #[arg(short = 'k', long)]
+    #[arg(short = 'k', long, default_value = "31", hide_short_help = true)]
     pub k: usize,
     /// Minimum distinct spanning read IDs required (at least 2)
-    #[arg(long)]
+    #[arg(long, default_value_t = 3, hide_short_help = true)]
     pub min_reads: usize,
     /// Minimum unanimous MSA columns, as a percentage in (0,100]
-    #[arg(long)]
+    #[arg(long, default_value_t = 50.0, hide_short_help = true)]
     pub min_quality: f64,
     /// Minimizer size (default: min(k,15); at most 29)
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, hide_short_help = true)]
     pub minimizer: Option<usize>,
     /// Parallel read workers (default: available CPUs)
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
     /// Concurrent gap MSAs (default: threads)
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub msa_threads: Option<usize>,
     /// Reject a gap if any unambiguous spanning interval exceeds this many bases
-    #[arg(long, default_value_t = 50_000)]
+    #[arg(long, default_value_t = 50_000, hide_short_help = true)]
     pub max_span: usize,
     /// Reject a gap if more distinct spanning reads would be retained; never subsample
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 256, hide_short_help = true)]
     pub max_reads_per_gap: usize,
     /// Maximum retained sequence plus read-ID bytes for one gap
-    #[arg(long, default_value_t = 4_194_304)]
+    #[arg(long, default_value_t = 4_194_304, hide_short_help = true)]
     pub max_gap_bytes: usize,
     /// Maximum total retained evidence bytes (sequence plus IDs)
-    #[arg(long, default_value_t = 536_870_912)]
+    #[arg(long, default_value_t = 536_870_912, hide_short_help = true)]
     pub max_evidence_bytes: usize,
     /// Conservative bound sum(span lengths)*max(span length) before a nontrivial MSA
-    #[arg(long, default_value_t = 20_000_000)]
+    #[arg(long, default_value_t = 20_000_000, hide_short_help = true)]
     pub max_msa_cells: usize,
     /// Target bases per input batch; two batches may be queued
-    #[arg(long, default_value_t = 16_777_216)]
+    #[arg(long, default_value_t = 16_777_216, hide_short_help = true)]
     pub batch_bases: usize,
     /// Fail on longer input reads (checked after helicase parses the record)
-    #[arg(long, default_value_t = 10_000_000)]
+    #[arg(long, default_value_t = 10_000_000, hide_short_help = true)]
     pub max_read_bases: usize,
+    /// Stream uncompressed reads instead of memory mapping and parallel parsing
+    #[arg(long, hide_short_help = true)]
+    pub stream_reads: bool,
 }
 
 impl Args {
+    pub fn report_path(&self) -> Cow<'_, Path> {
+        self.report.as_deref().map_or_else(
+            || {
+                let mut path = self.output.as_os_str().to_os_string();
+                path.push(".gaps.tsv");
+                Cow::Owned(PathBuf::from(path))
+            },
+            Cow::Borrowed,
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!((3..=63).contains(&self.k), "k must be in 3..=63");
         let m = self.minimizer.unwrap_or(self.k.min(15));
@@ -127,7 +144,8 @@ impl Args {
             self.max_span <= self.max_read_bases && self.max_read_bases <= u32::MAX as usize / 2,
             "max-span must be <= max-read-bases; max-read-bases must be <= 2^31-1"
         );
-        for path in [&self.output, &self.report] {
+        let report = self.report_path();
+        for path in [self.output.as_path(), report.as_ref()] {
             ensure!(
                 std::fs::symlink_metadata(path).is_err(),
                 "Output already exists: {}",
@@ -136,7 +154,7 @@ impl Args {
             normalized_destination(path)?;
         }
         ensure!(
-            normalized_destination(&self.output)? != normalized_destination(&self.report)?,
+            normalized_destination(&self.output)? != normalized_destination(&report)?,
             "FASTA and report must have different paths"
         );
         if let Some(path) = &self.timings {
@@ -148,7 +166,7 @@ impl Args {
             let destination = normalized_destination(path)?;
             ensure!(
                 destination != normalized_destination(&self.output)?
-                    && destination != normalized_destination(&self.report)?,
+                    && destination != normalized_destination(&report)?,
                 "Timing output must have a separate path"
             );
         }
@@ -174,6 +192,36 @@ struct Read {
     sequence: Vec<u8>,
 }
 
+enum ReadBatch {
+    Records(Vec<Read>),
+    Encoded(Vec<Range<usize>>),
+}
+
+fn read_id(parser: &impl HelicaseParser, args: &Args) -> Result<(Arc<[u8]>, u64)> {
+    let sequence = parser.get_dna_string();
+    ensure!(
+        sequence.len() <= args.max_read_bases,
+        "Read exceeds --max-read-bases"
+    );
+    let id = parser
+        .get_header()
+        .split(|b| b.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    ensure!(!id.is_empty(), "Read has an empty ID");
+    if matches!(parser.format(), Format::Fastq) {
+        ensure!(
+            parser
+                .get_quality()
+                .is_some_and(|q| q.len() == sequence.len()),
+            "FASTQ sequence and quality lengths differ"
+        );
+    }
+    let mut hasher = FxHasher::default();
+    hasher.write(id);
+    Ok((Arc::from(id), hasher.finish()))
+}
+
 thread_local! {
     static READ_SCANNER: RefCell<Scanner> = RefCell::new(Scanner::default());
 }
@@ -196,7 +244,7 @@ struct Evidence {
     duplicate_ids: usize,
     ids: Vec<Arc<[u8]>>,
     id_index: FxHashMap<u64, usize>,
-    sequences: Vec<Vec<u8>>,
+    sequences: Vec<Sequence>,
     bytes: usize,
     rejection: Option<&'static str>,
 }
@@ -268,7 +316,7 @@ impl Evidence {
 
 fn produce_reads(
     args: &Args,
-    tx: &crossbeam_channel::Sender<Result<Vec<Read>>>,
+    tx: &crossbeam_channel::Sender<Result<ReadBatch>>,
 ) -> Result<ReadTimings> {
     let mut clock = Instant::now();
     let mut timings = ReadTimings::default();
@@ -277,38 +325,21 @@ fn produce_reads(
     let mut bases = 0;
     let mut count = 0;
     while parser.next().is_some() {
-        let sequence = parser.get_dna_string();
-        ensure!(
-            sequence.len() <= args.max_read_bases,
-            "Read exceeds --max-read-bases"
-        );
-        let id = parser
-            .get_header()
-            .split(|b| b.is_ascii_whitespace())
-            .next()
-            .unwrap_or_default();
-        ensure!(!id.is_empty(), "Read has an empty ID");
-        if matches!(parser.format(), Format::Fastq) {
-            ensure!(
-                parser
-                    .get_quality()
-                    .is_some_and(|q| q.len() == sequence.len()),
-                "FASTQ sequence and quality lengths differ"
-            );
-        }
-        bases += sequence.len() + id.len();
-        let mut id_hasher = FxHasher::default();
-        id_hasher.write(id);
+        let (id, id_hash) = read_id(&parser, args)?;
+        bases += parser.get_dna_string().len() + id.len();
         batch.push(Read {
-            id: Arc::from(id),
-            id_hash: id_hasher.finish(),
+            id,
+            id_hash,
             sequence: parser.get_dna_string_owned(),
         });
         count += 1;
         if bases >= args.batch_bases {
             timings.parser += clock.elapsed().as_secs_f64();
             let wait = Instant::now();
-            if tx.send(Ok(std::mem::take(&mut batch))).is_err() {
+            if tx
+                .send(Ok(ReadBatch::Records(std::mem::take(&mut batch))))
+                .is_err()
+            {
                 timings.records = count;
                 return Ok(timings);
             }
@@ -320,11 +351,67 @@ fn produce_reads(
     timings.parser += clock.elapsed().as_secs_f64();
     if !batch.is_empty() {
         let wait = Instant::now();
-        let _ = tx.send(Ok(batch));
+        let _ = tx.send(Ok(ReadBatch::Records(batch)));
         timings.producer_wait += wait.elapsed().as_secs_f64();
     }
     ensure!(count > 0, "Read input contains no records");
     timings.records = count;
+    Ok(timings)
+}
+
+fn frame_reads(
+    args: &Args,
+    data: &[u8],
+    tx: &crossbeam_channel::Sender<Result<ReadBatch>>,
+    threads: usize,
+) -> Result<ReadTimings> {
+    const CONFIG: u64 = ParserOptions::default()
+        .ignore_dna()
+        .ignore_headers()
+        .config();
+    let mut parser = FastxParser::<CONFIG>::from_slice(data)?;
+    let chunk_size = args
+        .batch_bases
+        .div_ceil(threads.saturating_mul(2))
+        .clamp(65_536, 1_048_576);
+    let mut timings = ReadTimings::default();
+    let mut clock = Instant::now();
+    let mut batch = Vec::new();
+    let mut offset = 0;
+    let mut batch_start = 0;
+    for event in &mut parser {
+        if let Event::Record(range) = event {
+            ensure!(range.end <= data.len(), "Record exceeds input bounds");
+            timings.records += 1;
+            if range.end - offset >= chunk_size {
+                batch.push(offset..range.end);
+                offset = range.end;
+                if offset - batch_start >= args.batch_bases {
+                    timings.parser += clock.elapsed().as_secs_f64();
+                    let wait = Instant::now();
+                    if tx
+                        .send(Ok(ReadBatch::Encoded(std::mem::take(&mut batch))))
+                        .is_err()
+                    {
+                        return Ok(timings);
+                    }
+                    timings.producer_wait += wait.elapsed().as_secs_f64();
+                    clock = Instant::now();
+                    batch_start = offset;
+                }
+            }
+        }
+    }
+    if offset < data.len() {
+        batch.push(offset..data.len());
+    }
+    timings.parser += clock.elapsed().as_secs_f64();
+    if !batch.is_empty() {
+        let wait = Instant::now();
+        let _ = tx.send(Ok(ReadBatch::Encoded(batch)));
+        timings.producer_wait += wait.elapsed().as_secs_f64();
+    }
+    ensure!(timings.records > 0, "Read input contains no records");
     Ok(timings)
 }
 
@@ -343,10 +430,20 @@ fn collect(
         .collect();
     let mut total = 0;
     let mut buckets: Vec<Vec<(usize, Span)>> = (0..gaps.len()).map(|_| Vec::new()).collect();
+    let mapped = if args.stream_reads {
+        None
+    } else {
+        input::mmap_uncompressed(&args.reads)?
+    };
+    let data = mapped.as_ref().map(InputData::data);
     let timings = std::thread::scope(|scope| -> Result<ReadTimings> {
         let (tx, rx) = bounded(2);
         let producer = scope.spawn(move || {
-            let result = produce_reads(args, &tx);
+            let result = if let Some(data) = data {
+                frame_reads(args, data, &tx, pool.current_num_threads())
+            } else {
+                produce_reads(args, &tx)
+            };
             match result {
                 Ok(timings) => Ok(timings),
                 Err(error) => {
@@ -365,18 +462,57 @@ fn collect(
                 let Ok(batch) = batch else {
                     break;
                 };
-                let batch = batch?;
+                let incoming = batch?;
                 let clock = Instant::now();
-                let spans: Vec<_> = pool.install(|| {
-                    batch
-                        .par_iter()
-                        .map(|read| {
-                            READ_SCANNER.with_borrow_mut(|scanner| {
-                                index.extract(&read.sequence, scanner, args.max_span)
-                            })
-                        })
-                        .collect()
-                });
+                let (batch, spans): (Vec<Read>, Vec<Vec<(usize, Span)>>) = match incoming {
+                    ReadBatch::Records(batch) => {
+                        let spans = pool.install(|| {
+                            batch
+                                .par_iter()
+                                .map(|read| {
+                                    READ_SCANNER.with_borrow_mut(|scanner| {
+                                        index.extract(&read.sequence, scanner, args.max_span)
+                                    })
+                                })
+                                .collect()
+                        });
+                        (batch, spans)
+                    }
+                    ReadBatch::Encoded(ranges) => {
+                        let data = data.expect("Encoded batches require a mapped input");
+                        let chunks = pool.install(|| {
+                            ranges
+                                .par_iter()
+                                .map(|range| -> Result<Vec<_>> {
+                                    let mut parser = FastxParser::<{ input::CONFIG }>::from_slice(
+                                        &data[range.clone()],
+                                    )?;
+                                    let mut records = Vec::new();
+                                    while parser.next().is_some() {
+                                        let (id, id_hash) = read_id(&parser, args)?;
+                                        let found = READ_SCANNER.with_borrow_mut(|scanner| {
+                                            index.extract(
+                                                parser.get_dna_string(),
+                                                scanner,
+                                                args.max_span,
+                                            )
+                                        });
+                                        records.push((
+                                            Read {
+                                                id,
+                                                id_hash,
+                                                sequence: Vec::new(),
+                                            },
+                                            found,
+                                        ));
+                                    }
+                                    Ok(records)
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })?;
+                        chunks.into_iter().flatten().unzip()
+                    }
+                };
                 main_timings.extraction += clock.elapsed().as_secs_f64();
                 let clock = Instant::now();
                 let mut potential_bytes = 0usize;
@@ -462,8 +598,8 @@ fn decide(evidence: &mut Evidence, args: &Args) -> Result<Decision> {
         .sequences
         .iter()
         .all(|s| s == &evidence.sequences[0]);
-    let max_len = evidence.sequences.iter().map(Vec::len).max().unwrap();
-    let sum_len: usize = evidence.sequences.iter().map(Vec::len).sum();
+    let max_len = evidence.sequences.iter().map(|s| s.len()).max().unwrap();
+    let sum_len: usize = evidence.sequences.iter().map(|s| s.len()).sum();
     if !identical
         && sum_len
             .checked_mul(max_len)
@@ -509,7 +645,7 @@ fn write_outputs(
     decisions: &[Decision],
 ) -> Result<()> {
     let output = normalized_destination(&args.output)?;
-    let report = normalized_destination(&args.report)?;
+    let report = normalized_destination(&args.report_path())?;
     let mut fasta_tmp = NamedTempFile::new_in(output.parent().unwrap())?;
     let mut report_tmp = NamedTempFile::new_in(report.parent().unwrap())?;
     {
@@ -775,13 +911,33 @@ mod tests {
         let second = read(b"second");
         let mut evidence = Evidence::default();
         let mut total = 0;
-        evidence.add(Span::Sequence(b"A".to_vec()), &first, &args, &mut total);
-        evidence.add(Span::Sequence(b"C".to_vec()), &second, &args, &mut total);
-        evidence.add(Span::Sequence(b"C".to_vec()), &second, &args, &mut total);
+        evidence.add(
+            Span::Sequence(Sequence::from_slice(b"A")),
+            &first,
+            &args,
+            &mut total,
+        );
+        evidence.add(
+            Span::Sequence(Sequence::from_slice(b"C")),
+            &second,
+            &args,
+            &mut total,
+        );
+        evidence.add(
+            Span::Sequence(Sequence::from_slice(b"C")),
+            &second,
+            &args,
+            &mut total,
+        );
         assert_eq!(evidence.sequences.len(), 2);
         assert_eq!(evidence.duplicate_ids, 1);
         assert!(evidence.rejection.is_none());
-        evidence.add(Span::Sequence(b"T".to_vec()), &second, &args, &mut total);
+        evidence.add(
+            Span::Sequence(Sequence::from_slice(b"T")),
+            &second,
+            &args,
+            &mut total,
+        );
         assert_eq!(evidence.rejection, Some("conflicting_duplicate_read_id"));
         assert_eq!(total, 0);
         assert!(evidence.sequences.is_empty());

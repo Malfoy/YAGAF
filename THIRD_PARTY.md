@@ -58,6 +58,8 @@ YAGAF is GPL-3.0-only; the full license is in `LICENSE`.
 
 Every FASTA/FASTQ input is parsed by helicase 0.2.0:
 <https://github.com/imartayan/helicase>. YAGAF retains Ns, case, headers, and sequence
-coordinates. SIMD indexing uses simd-minimizers 2.3.1 and its matching packed-seq and
+coordinates. The uncompressed read path also uses helicase to frame record
+chunks before parsing them in parallel; compressed files retain its streaming
+decoders. SIMD indexing uses simd-minimizers 2.3.1 and its matching packed-seq and
 seq-hash versions. `Cargo.lock` pins the complete dependency graph; the vendored
 POASTA snapshot does not require a network Git checkout during a build.
