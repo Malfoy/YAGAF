@@ -1,4 +1,5 @@
 pub mod consensus;
+mod flank;
 pub mod index;
 pub mod input;
 pub mod pipeline;
@@ -9,7 +10,7 @@ pub struct Scaffold {
     pub sequence: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Gap {
     pub scaffold: usize,
     pub start: usize,

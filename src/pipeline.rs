@@ -1,12 +1,12 @@
 use crate::{
     Gap, Scaffold,
-    consensus::{self, Consensus, MsaBackend, Preset},
+    consensus::{self, Consensus, MsaBackend, MsaOrder, Preset},
     discover,
-    index::{Index, Scanner, Sequence, Span},
+    index::{Index, Recruitment, Scanner, Sequence, Span},
     input,
 };
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crossbeam_channel::bounded;
 use helicase::input::{FromSlice, InputData};
 use helicase::parser::{Event, Format};
@@ -23,11 +23,27 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RecruitmentMode {
+    Strict,
+    BestContext,
+    Adaptive,
+}
+impl RecruitmentMode {
+    fn primary(self) -> Recruitment {
+        if self == Self::BestContext {
+            Recruitment::BestContext
+        } else {
+            Recruitment::Strict
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "yagaf",
     version,
-    about = "Conservative parallel scaffold gap filling using exact flank anchors and POASTA"
+    about = "Conservative parallel scaffold gap filling with adaptive anchors and Rust POA"
 )]
 pub struct Args {
     /// Scaffold FASTA (plain, gzip, zstd, bzip2, or xz; detected by contents)
@@ -48,12 +64,36 @@ pub struct Args {
     /// Read technology; selects initial MSA scoring, not acceptance thresholds
     #[arg(long, value_enum, default_value = "hifi", hide_short_help = true)]
     pub preset: Preset,
-    /// MSA implementation; alternative engines are available for comparison
-    #[arg(long, value_enum, default_value = "poasta", hide_short_help = true)]
+    /// MSA engine (auto: POASTA for clean spans, SPOARS for divergent spans)
+    #[arg(long, value_enum, default_value = "auto", hide_short_help = true)]
     pub msa_backend: MsaBackend,
-    /// One adjacent anchor of this length on each side (3..=63)
+    /// Deterministic progressive MSA input order
+    #[arg(long, value_enum, default_value = "lexical", hide_short_help = true)]
+    pub msa_order: MsaOrder,
+    /// Exact seed length (3..=63)
     #[arg(short = 'k', long, default_value = "31", hide_short_help = true)]
     pub k: usize,
+    /// Known bases searched on each side of a gap (at least k)
+    #[arg(long, default_value_t = 100, hide_short_help = true)]
+    pub flank_window: usize,
+    /// Rescue context per side (default: min(primary window,50), at least k)
+    #[arg(long, hide_short_help = true)]
+    pub rescue_flank_window: Option<usize>,
+    /// Distance between seed starts (default: k/2); includes both window ends
+    #[arg(long, hide_short_help = true)]
+    pub anchor_step: Option<usize>,
+    /// Recruitment policy; adaptive rescues gaps with insufficient primary support
+    #[arg(long, value_enum, default_value = "adaptive", hide_short_help = true)]
+    pub recruitment: RecruitmentMode,
+    /// Minimum flank-edit score advantage for best-context recruitment
+    #[arg(long, default_value_t = 2, hide_short_help = true)]
+    pub recruitment_margin: usize,
+    /// Primary/single-tier edit cap (also bounded by floor(length/5)+2)
+    #[arg(long, default_value = "1", hide_short_help = true)]
+    pub max_flank_edits: Option<usize>,
+    /// Rescue edit cap (default: floor(context length/5)+2)
+    #[arg(long, hide_short_help = true)]
+    pub rescue_max_flank_edits: Option<usize>,
     /// Minimum distinct spanning read IDs required (at least 2)
     #[arg(long, default_value_t = 3, hide_short_help = true)]
     pub min_reads: usize,
@@ -73,16 +113,16 @@ pub struct Args {
     #[arg(long, default_value_t = 50_000, hide_short_help = true)]
     pub max_span: usize,
     /// Reject a gap if more distinct spanning reads would be retained; never subsample
-    #[arg(long, default_value_t = 256, hide_short_help = true)]
+    #[arg(long, default_value_t = 4096, hide_short_help = true)]
     pub max_reads_per_gap: usize,
-    /// Maximum retained sequence plus read-ID bytes for one gap
+    /// Maximum sequence plus read-ID bytes per gap and recruitment tier
     #[arg(long, default_value_t = 4_194_304, hide_short_help = true)]
     pub max_gap_bytes: usize,
     /// Maximum total retained evidence bytes (sequence plus IDs)
     #[arg(long, default_value_t = 536_870_912, hide_short_help = true)]
     pub max_evidence_bytes: usize,
     /// Conservative bound sum(span lengths)*max(span length) before a nontrivial MSA
-    #[arg(long, default_value_t = 20_000_000, hide_short_help = true)]
+    #[arg(long, default_value_t = 268_435_456, hide_short_help = true)]
     pub max_msa_cells: usize,
     /// Target bases per input batch; two batches may be queued
     #[arg(long, default_value_t = 16_777_216, hide_short_help = true)]
@@ -107,12 +147,37 @@ impl Args {
         )
     }
 
+    pub fn anchor_step(&self) -> usize {
+        self.anchor_step.unwrap_or((self.k / 2).max(1))
+    }
+
+    pub fn rescue_window(&self) -> usize {
+        self.rescue_flank_window
+            .unwrap_or(self.flank_window.min(50).max(self.k))
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!((3..=63).contains(&self.k), "k must be in 3..=63");
+        ensure!(
+            self.flank_window >= self.k,
+            "flank-window must be at least k"
+        );
+        ensure!(
+            (self.k..=self.flank_window).contains(&self.rescue_window()),
+            "rescue-flank-window must be between k and flank-window"
+        );
+        ensure!(
+            (1..=self.k).contains(&self.anchor_step()),
+            "anchor-step must be between 1 and k"
+        );
         let m = self.minimizer.unwrap_or(self.k.min(15));
         ensure!(
             m > 0 && m <= self.k && m <= 29,
             "minimizer must be in 1..=min(k,29)"
+        );
+        ensure!(
+            self.recruitment_margin > 0,
+            "recruitment-margin must be positive"
         );
         ensure!(self.min_reads >= 2, "min-reads must be at least 2");
         ensure!(
@@ -247,13 +312,27 @@ struct Evidence {
     sequences: Vec<Sequence>,
     bytes: usize,
     rejection: Option<&'static str>,
+    tier: &'static str,
+    primary_reads: Option<usize>,
+    rescue_reads: Option<usize>,
+    supplemental_primary_reads: usize,
 }
 
 impl Evidence {
+    fn locate_id(&self, id: &[u8], hash: u64) -> Option<usize> {
+        self.id_index.get(&hash).and_then(|&first| {
+            if self.ids[first].as_ref() == id {
+                Some(first)
+            } else {
+                self.ids.iter().position(|old| old.as_ref() == id)
+            }
+        })
+    }
     fn reject(&mut self, reason: &'static str, total: &mut usize) {
         self.rejection = Some(reason);
         *total -= self.bytes;
         self.bytes = 0;
+        self.supplemental_primary_reads = 0;
         self.ids.clear();
         self.id_index.clear();
         self.sequences.clear();
@@ -263,6 +342,9 @@ impl Evidence {
         self.candidates += 1;
         if matches!(span, Span::AmbiguousPair) {
             self.ambiguous_pairs += 1;
+            return;
+        }
+        if matches!(span, Span::Unplaced) {
             return;
         }
         self.spanning_records += 1;
@@ -275,16 +357,10 @@ impl Evidence {
                 self.reject(reason, total);
                 return;
             }
-            Span::AmbiguousPair => unreachable!(),
+            Span::AmbiguousPair | Span::Unplaced => unreachable!(),
         };
         let id = &read.id;
-        let previous = self.id_index.get(&read.id_hash).and_then(|&first| {
-            if self.ids[first].as_ref() == id.as_ref() {
-                Some(first)
-            } else {
-                self.ids.iter().position(|old| old.as_ref() == id.as_ref())
-            }
-        });
+        let previous = self.locate_id(id, read.id_hash);
         if let Some(previous) = previous {
             self.duplicate_ids += 1;
             if self.sequences[previous] != sequence {
@@ -312,6 +388,97 @@ impl Evidence {
         self.ids.push(Arc::clone(id));
         self.sequences.push(sequence);
     }
+}
+
+/// Select solely by mapping confidence and independent support, before any MSA.
+/// A rejected primary tier is never replaced by weaker evidence.
+fn select_evidence(mut evidence: Vec<Evidence>, gaps: usize, args: &Args) -> Vec<Evidence> {
+    if args.recruitment != RecruitmentMode::Adaptive {
+        for e in &mut evidence {
+            e.tier = "single";
+        }
+        return evidence;
+    }
+    assert_eq!(evidence.len(), 2 * gaps);
+    let rescue = evidence.split_off(gaps);
+    evidence
+        .into_iter()
+        .zip(rescue)
+        .map(|(mut primary, mut rescue)| {
+            let primary_reads = primary
+                .rejection
+                .is_none()
+                .then_some(primary.sequences.len());
+            let rescue_reads = rescue.rejection.is_none().then_some(rescue.sequences.len());
+            if primary.rejection.is_some()
+                || primary.sequences.len() >= args.min_reads
+                || (rescue.rejection.is_none() && rescue.sequences.is_empty())
+            {
+                if primary.rejection.is_none() && rescue.rejection.is_none() {
+                    let mut duplicates = 0;
+                    let mut conflict = false;
+                    for (id, sequence) in primary.ids.iter().zip(&primary.sequences) {
+                        let mut hasher = FxHasher::default();
+                        hasher.write(id);
+                        if let Some(previous) = rescue.locate_id(id, hasher.finish()) {
+                            duplicates += 1;
+                            conflict |= rescue.sequences[previous] != *sequence;
+                        }
+                    }
+                    primary.duplicate_ids += duplicates;
+                    if conflict {
+                        let mut local_total = primary.bytes;
+                        primary.reject("conflicting_duplicate_read_id", &mut local_total);
+                    }
+                }
+                primary.tier = "primary";
+                primary.primary_reads = primary_reads;
+                primary.rescue_reads = rescue_reads;
+                return primary;
+            }
+            rescue.tier = "rescue";
+            rescue.primary_reads = primary_reads;
+            rescue.rescue_reads = rescue_reads;
+            if rescue.rejection.is_some() {
+                return rescue;
+            }
+            // The primary index already excluded these physical records from the
+            // rescue tier. Repeated IDs across records still require verification.
+            let mut local_total = rescue.bytes + primary.bytes;
+            for (id, sequence) in primary.ids.drain(..).zip(primary.sequences.drain(..)) {
+                let mut hasher = FxHasher::default();
+                hasher.write(&id);
+                let hash = hasher.finish();
+                let previous = rescue.locate_id(&id, hash);
+                if let Some(previous) = previous {
+                    rescue.duplicate_ids += 1;
+                    if rescue.sequences[previous] != sequence {
+                        rescue.reject("conflicting_duplicate_read_id", &mut local_total);
+                        break;
+                    }
+                    continue;
+                }
+                let bytes = sequence.len() + id.len();
+                let reason = if rescue.sequences.len() == args.max_reads_per_gap {
+                    Some("read_support_limit")
+                } else if bytes > args.max_gap_bytes.saturating_sub(rescue.bytes) {
+                    Some("gap_evidence_limit")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    rescue.reject(reason, &mut local_total);
+                    break;
+                }
+                rescue.id_index.entry(hash).or_insert(rescue.ids.len());
+                rescue.ids.push(id);
+                rescue.sequences.push(sequence);
+                rescue.bytes += bytes;
+                rescue.supplemental_primary_reads += 1;
+            }
+            rescue
+        })
+        .collect()
 }
 
 fn produce_reads(
@@ -471,7 +638,11 @@ fn collect(
                                 .par_iter()
                                 .map(|read| {
                                     READ_SCANNER.with_borrow_mut(|scanner| {
-                                        index.extract(&read.sequence, scanner, args.max_span)
+                                        index.extract_audited(
+                                            &read.sequence,
+                                            scanner,
+                                            args.max_span,
+                                        )
                                     })
                                 })
                                 .collect()
@@ -491,7 +662,7 @@ fn collect(
                                     while parser.next().is_some() {
                                         let (id, id_hash) = read_id(&parser, args)?;
                                         let found = READ_SCANNER.with_borrow_mut(|scanner| {
-                                            index.extract(
+                                            index.extract_audited(
                                                 parser.get_dna_string(),
                                                 scanner,
                                                 args.max_span,
@@ -579,10 +750,40 @@ struct Decision {
     support: usize,
     consensus: Option<Consensus>,
     rejection: Option<&'static str>,
+    metrics: Option<SpanMetrics>,
+}
+
+#[derive(Clone, Copy)]
+struct SpanMetrics {
+    shortest: usize,
+    longest: usize,
+    bases: usize,
+    cells: Option<usize>,
+    quality_bound: f64,
+}
+
+impl SpanMetrics {
+    fn new(sequences: &[Sequence]) -> Option<Self> {
+        let first = sequences.first()?.len();
+        let (mut shortest, mut longest, mut bases) = (first, first, 0usize);
+        for sequence in sequences {
+            shortest = shortest.min(sequence.len());
+            longest = longest.max(sequence.len());
+            bases += sequence.len();
+        }
+        Some(Self {
+            shortest,
+            longest,
+            bases,
+            cells: bases.checked_mul(longest),
+            quality_bound: 100.0 * shortest as f64 / longest as f64,
+        })
+    }
 }
 
 fn decide(evidence: &mut Evidence, args: &Args) -> Result<Decision> {
     let support = evidence.sequences.len();
+    let metrics = SpanMetrics::new(&evidence.sequences);
     let mut rejection = evidence.rejection;
     if rejection.is_none() && support < args.min_reads {
         rejection = Some("insufficient_support");
@@ -592,27 +793,39 @@ fn decide(evidence: &mut Evidence, args: &Args) -> Result<Decision> {
             support,
             consensus: None,
             rejection,
+            metrics,
         });
     }
     let identical = evidence
         .sequences
         .iter()
         .all(|s| s == &evidence.sequences[0]);
-    let max_len = evidence.sequences.iter().map(|s| s.len()).max().unwrap();
-    let sum_len: usize = evidence.sequences.iter().map(|s| s.len()).sum();
-    if !identical
-        && sum_len
-            .checked_mul(max_len)
-            .is_none_or(|cells| cells > args.max_msa_cells)
-    {
+    // Any unanimous column consumes a base from the shortest sequence, while
+    // the alignment must contain at least as many columns as the longest one.
+    // This bound rejects only cases that no complete MSA could make eligible.
+    let stats = metrics.unwrap();
+    if stats.quality_bound < args.min_quality {
+        return Ok(Decision {
+            support,
+            consensus: None,
+            rejection: Some("msa_quality_bound"),
+            metrics,
+        });
+    }
+    if !identical && stats.cells.is_none_or(|cells| cells > args.max_msa_cells) {
         return Ok(Decision {
             support,
             consensus: None,
             rejection: Some("msa_size_limit"),
+            metrics,
         });
     }
-    let consensus =
-        consensus::build_with_backend(&mut evidence.sequences, args.preset, args.msa_backend)?;
+    let consensus = consensus::build_with_strategy(
+        &mut evidence.sequences,
+        args.preset,
+        args.msa_backend,
+        args.msa_order,
+    )?;
     rejection = consensus.rejection;
     if rejection.is_none() && consensus.quality < args.min_quality {
         rejection = Some("low_msa_quality");
@@ -621,6 +834,7 @@ fn decide(evidence: &mut Evidence, args: &Args) -> Result<Decision> {
         support,
         consensus: Some(consensus),
         rejection,
+        metrics,
     })
 }
 
@@ -676,7 +890,7 @@ fn write_outputs(
         let mut writer = BufWriter::new(report_tmp.as_file_mut());
         writeln!(
             writer,
-            "# yagaf={} preset={:?} k={} minimizer={} min_reads={} min_quality_percent={} max_span={} max_reads_per_gap={} max_gap_bytes={} max_evidence_bytes={} max_msa_cells={} msa_backend={}",
+            "# yagaf={} preset={:?} k={} minimizer={} min_reads={} min_quality_percent={} max_span={} max_reads_per_gap={} max_gap_bytes={} max_evidence_bytes={} max_msa_cells={} msa_backend={} flank_window={} anchor_step={} recruitment={:?} recruitment_margin={} msa_order={:?} max_flank_edits={:?} candidate_counting=selected-tier-paired-seeds report_schema=4 rescue_flank_window={} rescue_max_flank_edits={:?}",
             env!("CARGO_PKG_VERSION"),
             args.preset,
             args.k,
@@ -688,11 +902,19 @@ fn write_outputs(
             args.max_gap_bytes,
             args.max_evidence_bytes,
             args.max_msa_cells,
-            args.msa_backend.name()
+            args.msa_backend.name(),
+            args.flank_window,
+            args.anchor_step(),
+            args.recruitment,
+            args.recruitment_margin,
+            args.msa_order,
+            args.max_flank_edits,
+            args.rescue_window(),
+            args.rescue_max_flank_edits
         )?;
         writeln!(
             writer,
-            "gap_id\tscaffold_index\tscaffold_id\tstart_0based\tend_exclusive\toriginal_length\tcandidate_records\tspanning_records\tambiguous_pairs\tduplicate_read_ids\tretained_reads\tconsensus_length\tunanimous_columns\tmsa_columns\tmsa_quality_percent\tstatus\treason"
+            "gap_id\tscaffold_index\tscaffold_id\tstart_0based\tend_exclusive\toriginal_length\tcandidate_records\tspanning_records\tambiguous_pairs\tduplicate_read_ids\tretained_reads\tconsensus_length\tunanimous_columns\tmsa_columns\tmsa_quality_percent\tstatus\treason\tmsa_backend\trecruitment_tier\tprimary_reads\trescue_reads\tsupplemental_primary_reads\tshortest_span\tlongest_span\tretained_span_bases\tmsa_estimated_cells\tmsa_quality_upper_bound_percent"
         )?;
         for (id, ((gap, e), d)) in gaps.iter().zip(evidence).zip(decisions).enumerate() {
             let header = scaffolds[gap.scaffold]
@@ -711,12 +933,29 @@ fn write_outputs(
             } else {
                 "NA\tNA\tNA\tNA".into()
             };
+            let span_values = d.metrics.map_or_else(
+                || "NA\tNA\tNA\tNA\tNA".into(),
+                |s| {
+                    format!(
+                        "{}\t{}\t{}\t{}\t{:.8}",
+                        s.shortest,
+                        s.longest,
+                        s.bases,
+                        s.cells.map_or("overflow".into(), |n| n.to_string()),
+                        s.quality_bound
+                    )
+                },
+            );
+            let backend = d
+                .consensus
+                .as_ref()
+                .map_or("NA", |c| c.backend.map_or("identical", MsaBackend::name));
             let (status, reason) = d
                 .rejection
                 .map_or(("filled", "accepted"), |r| ("unchanged", r));
             writeln!(
                 writer,
-                "{id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{values}\t{status}\t{reason}",
+                "{id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{values}\t{status}\t{reason}\t{backend}\t{}\t{}\t{}\t{}\t{span_values}",
                 gap.scaffold,
                 tsv_id(header),
                 gap.start,
@@ -726,7 +965,11 @@ fn write_outputs(
                 e.spanning_records,
                 e.ambiguous_pairs,
                 e.duplicate_ids,
-                d.support
+                d.support,
+                e.tier,
+                e.primary_reads.map_or("NA".into(), |n| n.to_string()),
+                e.rescue_reads.map_or("NA".into(), |n| n.to_string()),
+                e.supplemental_primary_reads
             )?;
         }
         writer.flush()?;
@@ -764,7 +1007,39 @@ pub fn run(args: &Args) -> Result<()> {
     let gaps = discover(&scaffolds, args.k);
     mark_phase(&mut phases, &mut phase_clock, "gap_discovery");
     let m = args.minimizer.unwrap_or(args.k.min(15));
-    let index = pool.install(|| Index::new(&gaps, args.k, m));
+    let adaptive = args.recruitment == RecruitmentMode::Adaptive;
+    let indexed_gaps: Cow<'_, [Gap]> = if adaptive {
+        Cow::Owned(gaps.iter().cloned().chain(gaps.iter().cloned()).collect())
+    } else {
+        Cow::Borrowed(&gaps)
+    };
+    let index = pool.install(|| {
+        let primary = Index::with_windows(
+            &scaffolds,
+            &gaps,
+            args.k,
+            m,
+            args.flank_window,
+            args.anchor_step(),
+        )
+        .with_recruitment(args.recruitment.primary(), args.recruitment_margin)
+        .with_flank_edit_limit(args.max_flank_edits);
+        if adaptive {
+            let rescue = Index::with_windows(
+                &scaffolds,
+                &gaps,
+                args.k,
+                m,
+                args.rescue_window(),
+                args.anchor_step(),
+            )
+            .with_recruitment(Recruitment::BestContext, args.recruitment_margin)
+            .with_flank_edit_limit(args.rescue_max_flank_edits);
+            primary.with_fallback(rescue)
+        } else {
+            primary
+        }
+    });
     mark_phase(&mut phases, &mut phase_clock, "index_build");
     eprintln!(
         "Indexed {} gaps ({} eligible) in {:.3}s; {} read workers, {} MSA workers",
@@ -775,11 +1050,12 @@ pub fn run(args: &Args) -> Result<()> {
         msa_threads
     );
     let scan_start = Instant::now();
-    let (mut evidence, reads) = if gaps.iter().any(|g| g.rejection.is_none()) {
-        collect(args, &index, &gaps, &pool)?
+    let (evidence, reads) = if gaps.iter().any(|g| g.rejection.is_none()) {
+        collect(args, &index, &indexed_gaps, &pool)?
     } else {
         (
-            gaps.iter()
+            indexed_gaps
+                .iter()
                 .map(|g| Evidence {
                     rejection: g.rejection,
                     ..Evidence::default()
@@ -789,6 +1065,7 @@ pub fn run(args: &Args) -> Result<()> {
         )
     };
     drop(index);
+    let mut evidence = select_evidence(evidence, gaps.len(), args);
     eprintln!(
         "Scanned {} reads in {:.3}s",
         reads.records,

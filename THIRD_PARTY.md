@@ -18,6 +18,11 @@ YAGAF is GPL-3.0-only; the full license is in `LICENSE`.
   runs in parallel; repeated assembly anchors remain indexed for every gap. Each
   ACTG run is processed independently; ambiguous bases are never removed to
   concatenate unrelated sequence runs. Reverse complements are indexed explicitly.
+  Overlapping seeds from bounded flank windows share this index. Cached Myers
+  bit-vector alignment projects seed hits through known flanks; unique validated
+  read intervals contribute at most one span per gap and read. Primary and rescue
+  queries share this index; primary ambiguity blocks weaker placement, and tier
+  selection uses support before any alignment score is computed.
 
 ## POASTA
 

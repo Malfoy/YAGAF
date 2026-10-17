@@ -1,5 +1,9 @@
 # E. coli reference recovery experiment
 
+The settings and measurements below are historical. Current adaptive-window and
+MSA comparisons are in [the recruitment experiment](../recruitment/README.md).
+Assembly-wide anchor uniqueness is not a current requirement.
+
 Run on 2026-10-16, using the initial Gapfil Rust implementation. Every FASTA read,
 including simulation input and corrected-output evaluation, uses helicase.
 

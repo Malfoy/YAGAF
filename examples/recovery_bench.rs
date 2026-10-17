@@ -1,5 +1,5 @@
 //! Reproducible masking/recovery experiment on a supplied reference.
-//! Approximate HiFi-like Q30 reads, not an empirical PacBio CCS model.
+//! Independent-error long reads, not an empirical sequencing-technology model.
 //! Every FASTA read goes through helicase.
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
@@ -34,6 +34,11 @@ struct Options {
     seed: u64,
     #[arg(long, default_value_t = 4)]
     threads: usize,
+    /// Generate inputs without running gap filling.
+    #[arg(long)]
+    prepare_only: bool,
+    #[arg(long, default_value_t = 3)]
+    min_reads: usize,
     #[arg(long, default_value_t = 100.0)]
     min_quality: f64,
 }
@@ -195,13 +200,16 @@ fn main() -> Result<()> {
     let mut parameters = File::create(options.directory.join("parameters.txt"))?;
     writeln!(
         parameters,
-        "{options:#?}\nreference_header={}\ngenome_length={genome_len}\nmodel=independent Q30-like errors, equal S/I/D; truncated normal lengths; uniform circular starts; random strands\ncalibrated_hifi_model=false\ntemplate_bases={consumed}\nread_bases={read_bases}\nread_count={read_count}\nsubstitutions={}\ninsertions={}\ndeletions={}\ngeneration_seconds={:.6}",
+        "{options:#?}\nreference_header={}\ngenome_length={genome_len}\nmodel=independent errors at configured rate, equal S/I/D; truncated normal lengths; uniform circular starts; random strands\ncalibrated_hifi_model=false\ntemplate_bases={consumed}\nread_bases={read_bases}\nread_count={read_count}\nsubstitutions={}\ninsertions={}\ndeletions={}\ngeneration_seconds={:.6}",
         String::from_utf8_lossy(&reference.header),
         total_errors[0],
         total_errors[1],
         total_errors[2],
         generation.elapsed().as_secs_f64()
     )?;
+    if options.prepare_only {
+        return Ok(());
+    }
     let executable = std::env::current_exe()?
         .parent()
         .unwrap()
@@ -228,7 +236,7 @@ fn main() -> Result<()> {
             "--k",
             "31",
             "--min-reads",
-            "5",
+            &options.min_reads.to_string(),
             "--min-quality",
             &options.min_quality.to_string(),
             "--threads",

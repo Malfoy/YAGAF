@@ -54,7 +54,7 @@ fn main() -> Result<()> {
             .context("Missing report row")?
             .split('\t')
             .collect();
-        ensure!(fields.len() == 17, "Unexpected report columns");
+        ensure!(fields.len() >= 17, "Unexpected report columns");
         ensure!(
             fields[3].parse::<usize>()? == gap.start && fields[4].parse::<usize>()? == gap.end,
             "Report coordinates differ"
@@ -79,6 +79,13 @@ fn main() -> Result<()> {
                 exact_gaps += 1;
             } else {
                 wrong_gaps += 1;
+                eprintln!(
+                    "Incorrect fill at {}..{}: observed {} bases, expected {}",
+                    gap.start,
+                    gap.end,
+                    length,
+                    gap.end - gap.start
+                );
             }
             if length == gap.end - gap.start {
                 for (a, b) in observed.iter().zip(&truth[gap.start..gap.end]) {

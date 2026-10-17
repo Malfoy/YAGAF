@@ -7,3 +7,5 @@
 /results/
 /reads.fa.gz
 /scafolds.fa.gz
+
+__pycache__/

@@ -9,6 +9,7 @@ use poasta::io::fasta::poa_graph_to_msa;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MsaBackend {
+    Auto,
     Poasta,
     Spoars,
     SpoarsScalar,
@@ -17,11 +18,19 @@ pub enum MsaBackend {
 impl MsaBackend {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Poasta => "poasta",
             Self::Spoars => "spoars",
             Self::SpoarsScalar => "spoars-scalar",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MsaOrder {
+    Lexical,
+    LongestFirst,
+    MedianFirst,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -47,6 +56,7 @@ pub struct Consensus {
     pub columns: usize,
     pub quality: f64,
     pub rejection: Option<&'static str>,
+    pub backend: Option<MsaBackend>,
 }
 
 pub fn from_rows(rows: &[Vec<u8>]) -> Result<Consensus> {
@@ -105,6 +115,7 @@ pub fn from_rows(rows: &[Vec<u8>]) -> Result<Consensus> {
             100.0 * unanimous as f64 / columns as f64
         },
         rejection,
+        backend: None,
     })
 }
 
@@ -116,6 +127,15 @@ pub fn build_with_backend<S: AsRef<[u8]>>(
     sequences: &mut [S],
     preset: Preset,
     backend: MsaBackend,
+) -> Result<Consensus> {
+    build_with_strategy(sequences, preset, backend, MsaOrder::Lexical)
+}
+
+pub fn build_with_strategy<S: AsRef<[u8]>>(
+    sequences: &mut [S],
+    preset: Preset,
+    backend: MsaBackend,
+    order: MsaOrder,
 ) -> Result<Consensus> {
     ensure!(!sequences.is_empty(), "No consensus evidence");
     ensure!(
@@ -135,17 +155,93 @@ pub fn build_with_backend<S: AsRef<[u8]>>(
             columns: len,
             quality: 100.0,
             rejection: None,
+            backend: None,
         });
     }
+    let backend = if backend == MsaBackend::Auto {
+        automatic_backend(sequences)
+    } else {
+        backend
+    };
     // Stable lexical order makes progressive POA independent of worker scheduling.
-    sequences.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    sequences.sort_unstable_by(|a, b| match order {
+        MsaOrder::LongestFirst => b
+            .as_ref()
+            .len()
+            .cmp(&a.as_ref().len())
+            .then_with(|| a.as_ref().cmp(b.as_ref())),
+        _ => a.as_ref().cmp(b.as_ref()),
+    });
+    if order == MsaOrder::MedianFirst {
+        let mut lengths: Vec<_> = sequences.iter().map(|s| s.as_ref().len()).collect();
+        let middle = lengths.len() / 2;
+        let median = *lengths.select_nth_unstable(middle).1;
+        let first = sequences
+            .iter()
+            .position(|s| s.as_ref().len() == median)
+            .unwrap();
+        sequences[..=first].rotate_right(1);
+    }
     let rows = match backend {
+        MsaBackend::Auto => unreachable!("Automatic backend must be resolved"),
         MsaBackend::Poasta => poasta_rows(sequences, preset)?,
         MsaBackend::Spoars => spoars_rows(sequences, preset, true)?,
         MsaBackend::SpoarsScalar => spoars_rows(sequences, preset, false)?,
     };
     validate_rows(&rows, sequences)?;
-    from_rows(&rows)
+    let mut consensus = from_rows(&rows)?;
+    consensus.backend = Some(backend);
+    Ok(consensus)
+}
+
+/// Route by exact short-word sharing, never by a preferred consensus or score.
+/// Every sequence remains in the eventual alignment with its original weight.
+fn automatic_backend<S: AsRef<[u8]>>(sequences: &[S]) -> MsaBackend {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    let mut frequencies: FxHashMap<&[u8], usize> = FxHashMap::default();
+    let mut lengths: Vec<_> = sequences.iter().map(|s| s.as_ref().len()).collect();
+    let middle = lengths.len() / 2;
+    let median = *lengths.select_nth_unstable(middle).1;
+    for s in sequences {
+        *frequencies.entry(s.as_ref()).or_default() += 1;
+    }
+    let reference = frequencies
+        .into_iter()
+        .min_by(|(a, ac), (b, bc)| {
+            bc.cmp(ac)
+                .then_with(|| a.len().abs_diff(median).cmp(&b.len().abs_diff(median)))
+                .then_with(|| a.cmp(b))
+        })
+        .unwrap()
+        .0;
+    let k = reference.len().min(15).min(*lengths.iter().min().unwrap());
+    let word = |s: &[u8]| {
+        s.iter().fold(0u32, |key, &b| {
+            (key << 2)
+                | match b.to_ascii_uppercase() {
+                    b'A' => 0,
+                    b'C' => 1,
+                    b'G' => 2,
+                    b'T' => 3,
+                    _ => unreachable!(),
+                }
+        })
+    };
+    let words: FxHashSet<_> = reference.windows(k).map(word).collect();
+    let (mut total, mut unmatched) = (0usize, 0usize);
+    for sequence in sequences {
+        let sequence = sequence.as_ref();
+        let count = sequence.len() - k + 1;
+        for start in (0..count).step_by(count.div_ceil(64)) {
+            total += 1;
+            unmatched += usize::from(!words.contains(&word(&sequence[start..start + k])));
+        }
+    }
+    if unmatched > total / 10 {
+        MsaBackend::Spoars
+    } else {
+        MsaBackend::Poasta
+    }
 }
 
 fn poasta_rows<S: AsRef<[u8]>>(sequences: &[S], preset: Preset) -> Result<Vec<Vec<u8>>> {
@@ -220,6 +316,43 @@ fn validate_rows<S: AsRef<[u8]>>(rows: &[Vec<u8>], sequences: &[S]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_engine_selection_uses_all_evidence_and_ignores_input_order() {
+        let mut state = 818725439263u64;
+        let truth: Vec<_> = (0..1000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[state as usize & 3]
+            })
+            .collect();
+        for (spacing, expected) in [(1000, MsaBackend::Poasta), (50, MsaBackend::Spoars)] {
+            let mut sequences = Vec::new();
+            for read in 0..12 {
+                let mut s = truth.clone();
+                for pos in (read..s.len()).step_by(spacing) {
+                    s[pos] = if s[pos] == b'A' { b'C' } else { b'A' };
+                }
+                sequences.push(s);
+            }
+            assert_eq!(automatic_backend(&sequences), expected);
+            sequences.reverse();
+            assert_eq!(automatic_backend(&sequences), expected);
+            let mut forced = sequences.clone();
+            let actual =
+                build_with_backend(&mut sequences, Preset::Hifi, MsaBackend::Auto).unwrap();
+            let reference = build_with_backend(&mut forced, Preset::Hifi, expected).unwrap();
+            assert_eq!(actual.backend, Some(expected));
+            assert_eq!(actual.sequence, truth);
+            assert_eq!(actual.sequence, reference.sequence);
+            assert_eq!(
+                (actual.unanimous, actual.columns),
+                (reference.unanimous, reference.columns)
+            );
+        }
+    }
 
     #[test]
     fn inline_and_heap_evidence_produce_the_same_msa_metrics() {
